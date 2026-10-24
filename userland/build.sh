@@ -51,8 +51,10 @@
 #                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
 #                      ADSP=1       with the audio DSP's firmware from ../fw-audio in fw/ (20 MB; for the
 #                                   kernel's adsp_step=N, bsd/dev/redwood_adsp.c, which runs before the root is
-#                                   mounted). Not beside GL=1: the two do not fit the 64 MB the loader takes with
-#                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
+#                                   mounted). Not beside GL=1 on the redwood: the two do not fit the 64 MB the loader
+#                                   takes with the kernel. adsp=1 needs none of it: the system image has the firmware
+#                                   in /fw. (lemonadep: its system image has no firmware, so its profile has GL=1 ADSP=1:
+#                                   its 16 MB image makes root.apfs 27.5 MB, which fits with the 15 MB kernel.)
 #   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
 #                    APFS container: the part of iOS 16.5 chosen by ../ios165/select-system.py at
 #                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
