@@ -1306,6 +1306,148 @@ struct rwa_draw {
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
 
+/*
+ * RENDER PASSES, which is what a driver draws with. rwa_render_draw above is one draw in a
+ * pass of its own, waited for: right for a test, and a GPU round trip per draw, with each
+ * draw applying the pass's load action again. A Metal render command encoder is instead
+ * ONE pass: its attachments' load actions once, then its draws in order, each with the
+ * encoder's state at the time it was encoded. And a command buffer goes to the GPU once,
+ * at rwa_submit.
+ *
+ * rwa_pass_draw takes the same rwa_draw as rwa_render_draw and checks it the same way,
+ * except that its colour and depth attachments and their clears are the pass's: the
+ * fields are ignored. Everything Metal keeps on the encoder rather than in a state object
+ * is in rwa_draw_state, in Metal's own terms:
+ *
+ *   viewport        originX, originY, width, height, znear, zfar; a width of 0 is the
+ *                   whole pass with depth range [0, 1]
+ *   scissor         x, y, width, height, used when scissor_enabled
+ *   cull_mode       MTLCullMode (None 0, Front 1, Back 2)
+ *   front_winding   MTLWinding (Clockwise 0, CounterClockwise 1)
+ *   fill_mode       MTLTriangleFillMode (Fill 0, Lines 1)
+ *   depth_clip_mode MTLDepthClipMode (Clip 0, Clamp 1)
+ *   depth_bias ...  -setDepthBias:slopeScale:clamp:
+ *   blend_color     -setBlendColorRed:green:blue:alpha:, what the blend colour factors read
+ *
+ * A pass's bindings stay in the context until rwa_pass_end (or the next rwa_pass_begin,
+ * or rwa_submit), so nothing a draw of the pass uses may be destroyed before then.
+ *
+ * rwa_device_lock and rwa_device_unlock hold the device's context for the caller: Metal
+ * commits from any thread, and a pass must not be interleaved with another thread's work.
+ * Every call of this library takes the same (recursive) lock itself as well.
+ */
+enum rwa_load_action {
+	RWA_LOAD_DONT_CARE = 0,   /* MTLLoadActionDontCare */
+	RWA_LOAD_LOAD = 1,        /* MTLLoadActionLoad */
+	RWA_LOAD_CLEAR = 2,       /* MTLLoadActionClear */
+};
+
+struct rwa_pass_color {
+	struct rwa_texture *texture;   /* NULL: no attachment at this index */
+	unsigned level, slice;
+	unsigned load_action;          /* enum rwa_load_action */
+	float clear[4];
+};
+
+struct rwa_pass_desc {
+	struct rwa_pass_color color[8];
+	unsigned color_count;          /* highest attachment index + 1 */
+	struct rwa_texture *depth;     /* the depth/stencil attachment, or NULL */
+	unsigned depth_level, depth_slice;
+	unsigned depth_load_action, stencil_load_action;
+	double clear_depth;
+	unsigned clear_stencil;
+};
+
+struct rwa_draw_state {
+	float viewport[6];
+	unsigned scissor_enabled;
+	unsigned scissor[4];
+	unsigned cull_mode, front_winding, fill_mode, depth_clip_mode;
+	float depth_bias, depth_slope_scale, depth_bias_clamp;
+	float blend_color[4];
+};
+
+void rwa_device_lock(struct rwa_device *device);
+void rwa_device_unlock(struct rwa_device *device);
+
+/*
+ * FUNCTION CONSTANTS. A specialised MTLFunction (-newFunctionWithDescriptor: with constant
+ * values, -newFunctionWithName:constantValues:) carries its values; these take them, by
+ * Metal's own constant index, with the value's bytes in `bits` as memcpy would put them on
+ * this little-endian machine (a vector's component i at bit i * its width). With
+ * `constants` NULL the function is unspecialised: every constant the module declares is
+ * zero and counts as defined, which is what the plain calls do. Otherwise -- a specialised
+ * function, even one with no values -- exactly the constants named are defined, and
+ * air.is_function_constant_defined answers false for every other one, as Metal does.
+ */
+struct rwa_constant {
+	unsigned index;
+	uint64_t bits;
+};
+
+struct rwa_compute *rwa_compute_create_with_constants(struct rwa_device *device,
+						      const void *bitcode, size_t size,
+						      const char *entry,
+						      const struct rwa_constant *constants,
+						      unsigned constant_count,
+						      struct rwa_compute_info *info,
+						      char *why, size_t why_size);
+struct rwa_render *rwa_render_create_with_constants(struct rwa_device *device,
+						    const void *vertex_bitcode,
+						    size_t vertex_size, const char *vertex_entry,
+						    const struct rwa_constant *vertex_constants,
+						    unsigned vertex_constant_count,
+						    const void *fragment_bitcode,
+						    size_t fragment_size,
+						    const char *fragment_entry,
+						    const struct rwa_constant *fragment_constants,
+						    unsigned fragment_constant_count,
+						    const struct rwa_render_shape *shape,
+						    struct rwa_render_info *info, char *why,
+						    size_t why_size);
+
+int rwa_pass_begin(struct rwa_device *device, const struct rwa_pass_desc *pass,
+		   char *why, size_t why_size);
+int rwa_pass_draw(struct rwa_render *render, const struct rwa_draw *draw,
+		  const struct rwa_draw_state *state, char *why, size_t why_size);
+void rwa_pass_end(struct rwa_device *device);
+
+/* Metal's MTLStoreActionMultisampleResolve for colour attachment `attachment` of the pass
+ * begun last: when the pass ends, its samples are resolved into `resolve` (one sample, the
+ * attachment's size) at `level` and array `slice`. 0, or -1 and a sentence. */
+int rwa_pass_resolve(struct rwa_device *device, unsigned attachment, struct rwa_texture *resolve,
+		     unsigned level, unsigned slice, char *why, size_t why_size);
+
+/* Everything encoded so far to the GPU; with `wait`, returns once the GPU has finished it,
+ * or -1 and a sentence when it did not within two seconds. */
+int rwa_submit(struct rwa_device *device, int wait, char *why, size_t why_size);
+
+/*
+ * MTLBlitCommandEncoder's work, in command buffer order: buffer and texture copies, a
+ * buffer fill and mipmap generation. A copy between a buffer and a texture finishes the
+ * GPU's earlier work first (it reads or writes the buffer through the processor).
+ * `slice` is an array slice; a 3D texture's depth is the third coordinate of origin and
+ * size instead.
+ */
+int rwa_copy_buffer(struct rwa_buffer *src, size_t src_offset, struct rwa_buffer *dst,
+		    size_t dst_offset, size_t size, char *why, size_t why_size);
+int rwa_fill_buffer(struct rwa_buffer *dst, size_t offset, size_t size, unsigned char value,
+		    char *why, size_t why_size);
+int rwa_copy_texture(struct rwa_texture *src, unsigned src_slice, unsigned src_level,
+		     const unsigned src_origin[3], const unsigned size[3],
+		     struct rwa_texture *dst, unsigned dst_slice, unsigned dst_level,
+		     const unsigned dst_origin[3], char *why, size_t why_size);
+int rwa_generate_mipmaps(struct rwa_texture *texture, char *why, size_t why_size);
+int rwa_copy_buffer_to_texture(struct rwa_buffer *src, size_t offset, size_t bytes_per_row,
+			       size_t bytes_per_image, const unsigned size[3],
+			       struct rwa_texture *dst, unsigned slice, unsigned level,
+			       const unsigned origin[3], char *why, size_t why_size);
+int rwa_copy_texture_to_buffer(struct rwa_texture *src, unsigned slice, unsigned level,
+			       const unsigned origin[3], const unsigned size[3],
+			       struct rwa_buffer *dst, size_t offset, size_t bytes_per_row,
+			       size_t bytes_per_image, char *why, size_t why_size);
+
 #ifdef __cplusplus
 }
 #endif

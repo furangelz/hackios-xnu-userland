@@ -163,6 +163,20 @@ struct air_resource {
     */
    unsigned argbuf_set;
    unsigned argbuf_id;
+
+   /* A `device` buffer this shader reads at whatever offset Metal allows (a multiple of
+    * four), and not only at the offsets the GPU fetches from: set by the runtime
+    * (air_metal.c, ssbo_any_offset) after translating, never by the frontend. The binding
+    * then starts at the fetchable offset below Metal's, and the shader adds the rest,
+    * which it reads out of the constant buffer at air_shader_info.ssbo_offset_slot_plus1.
+    */
+   bool any_offset;
+
+   /* No instruction of the translated function names this resource any more: a
+    * specialisation folded away every use of it. Metal calls such an argument inactive
+    * and does not require it to be bound, and neither does the library (set by the
+    * library, not by the frontend: air_metal.c's mark_unused_resources). */
+   bool unused;
 };
 
 struct air_varying {
@@ -318,6 +332,13 @@ struct air_shader_info {
    const char **notes;
 
    unsigned threadgroup_bytes; /* static threadgroup memory */
+
+   /* The constant buffer slot, plus one, where the runtime puts the part of each
+    * `device` buffer's offset the GPU cannot fetch from (air_resource.any_offset): 32
+    * words, one per buffer binding. 0 when the shader reads no such buffer. Set by the
+    * runtime, never by the frontend.
+    */
+   unsigned ssbo_offset_slot_plus1;
 };
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call
