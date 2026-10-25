@@ -4988,38 +4988,3 @@ file (a narrow type, and `ffma` through TGSI's `MAD`). Whether the Adreno agrees
 question and this file cannot answer it. Two things would make the meter honest and neither is
 this change: `collect_declarations` should fail loudly on a library it could not read, and the
 `tail -6` should be wide enough to show the line that says how much of the suite was judged.
-
-## 9. The window server's own shaders (2026-10-25)
-
-On the OnePlus 9 Pro the frontend now translates what CoreAnimation, RenderBox and MetalPerformanceShaders draw
-with, and with `camtl=1` the window server composites the lock screen, home screen, widgets and Today view through
-it (`docs/lemonadep.md` in the kernel repository has the boot-args). Measured on this machine with
-`research/lemon/metal/uitest.sh` (translate, then ir3 for the 660, every function of a library, unspecialised):
-
-| Library | Functions | Translate and compile | What is left |
-|---|---|---|---|
-| QuartzCore | 141 | 137 | four tile shaders read an imageblock |
-| RenderBox | 47 | 47 | |
-| MPSImage | 1 825 | 1 632 | SIMD-group barriers and shuffles, pointer phis over loop edges |
-| SiriUICore | 20 | 19 | SiriBlur writes a mip level chosen at run time |
-
-The system corpus of section 5 is unchanged (321 of 456, cpuref 255 agree, intrincheck folded 0 differ).
-
-What it took, in the order the phone asked for it:
-
-- **Specialised functions.** CoreAnimation draws every layer with one uber-shader specialised by 58 function
-  constants. The driver hands the constants over (`rwa_render_create_with_constants`); a specialised function
-  defines exactly the constants it was given, as Metal does. `air2nir --fc INDEX=VALUE,...` translates the same.
-- **Static initializers evaluated** (`air_partial.c`): the uber-shader copies its constants into program-scope
-  variables in `air.static_init`. Evaluating that at translation time makes them constant data, and a branch on
-  a known condition translates only the edge taken -- most of the uber-shader is never translated for a given
-  specialisation.
-- **Inactive arguments.** A resource no instruction of the specialised function uses is neither required nor
-  bound (`mark_unused_resources` in `air_metal.c`): the window server binds only what a specialisation reads.
-- **Structs and pointers passed to functions of the module** are handed over as trees: numbers and run-time
-  offsets as NIR parameters, constant offsets rebuilt in the callee, and the pointers the caller keeps in its
-  locals carried in and out (MPS's Gaussian blur keeps its texture in a local struct; RenderBox passes its
-  globals as a struct of arrays).
-- **Integers of widths NIR lacks** (RenderBox's `i2` .. `i10`) are held zero-extended in the next width and
-  sign-extended where read as signed; nested undefined aggregates, bool outputs widened, returns lowered before
-  inlining, indices of any width converted with LLVM's signedness, `max3`/`min3`/`median3`, `pack_unorm_rgb565`.

@@ -447,23 +447,6 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fast_fmax") || !strcmp(op, "fmax") || !strcmp(op, "max")) {
       r = is_float ? nir_fmax(&c->b, a[0], a[1])
                    : (is_signed ? nir_imax(&c->b, a[0], a[1]) : nir_umax(&c->b, a[0], a[1]));
-   } else if (!strcmp(op, "fast_fmax3") || !strcmp(op, "fmax3") || !strcmp(op, "max3") ||
-              !strcmp(op, "fast_fmin3") || !strcmp(op, "fmin3") || !strcmp(op, "min3") ||
-              !strcmp(op, "fast_fmedian3") || !strcmp(op, "fmedian3") ||
-              !strcmp(op, "median3")) {
-      /* Metal's max3, min3 and median3, which RenderBox blends with. The median is
-       * max(min(a, b), min(max(a, b), c)): whichever of a and b is lower, raised to c
-       * but not past the higher one. */
-      nir_def *(*mn)(nir_builder *, nir_def *, nir_def *) =
-         is_float ? nir_fmin : is_signed ? nir_imin : nir_umin;
-      nir_def *(*mx)(nir_builder *, nir_def *, nir_def *) =
-         is_float ? nir_fmax : is_signed ? nir_imax : nir_umax;
-      if (strstr(op, "max3"))
-         r = mx(&c->b, mx(&c->b, a[0], a[1]), a[2]);
-      else if (strstr(op, "min3"))
-         r = mn(&c->b, mn(&c->b, a[0], a[1]), a[2]);
-      else
-         r = mx(&c->b, mn(&c->b, a[0], a[1]), mn(&c->b, mx(&c->b, a[0], a[1]), a[2]));
    } else if (!strcmp(op, "fast_clamp") || !strcmp(op, "clamp")) {
       if (is_float)
          r = nir_fmin(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]);
@@ -555,20 +538,6 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
        */
       r = nir_b2iN(&c->b, nir_ine_imm(&c->b, a[0], 0),
                    air_nir_bit_size(c, in->base.type));
-   } else if (!strcmp(op, "pack") && n->num >= 3 && !strcmp(n->part[1], "unorm") &&
-              !strcmp(n->part[2], "rgb565")) {
-      /* three normalised floats in one 16-bit word, the first in bits 0-4, the second
-       * in 5-10 and the third in 11-15: the order of Metal's other packs (component 0
-       * lowest), and the one RenderBox's resolve shaders assume when they turn the word
-       * into 5-5-5 by keeping bits 0-4 and moving the rest down one. Each is rounded to
-       * the nearest step, as a unorm conversion is. */
-      nir_def *v = nir_f2f32(&c->b, nir_fsat(&c->b, a[0]));
-      nir_def *q = nir_f2u32(&c->b, nir_fround_even(&c->b,
-                     nir_fmul(&c->b, v, nir_imm_vec3(&c->b, 31.0f, 63.0f, 31.0f))));
-      nir_def *w = nir_ior(&c->b, nir_channel(&c->b, q, 0),
-                           nir_ior(&c->b, nir_ishl_imm(&c->b, nir_channel(&c->b, q, 1), 5),
-                                   nir_ishl_imm(&c->b, nir_channel(&c->b, q, 2), 11)));
-      r = nir_u2uN(&c->b, w, air_nir_bit_size(c, in->base.type));
    } else if (!strcmp(op, "unpack") && n->num >= 2 &&
               !strcmp(n->part[1], "unorm4x8")) {
       /* four unsigned bytes of a word, each divided by 255. Component 0 is the
@@ -1578,8 +1547,6 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
    return coord;
 }
 
-static bool null_texture_result(struct air_ctx *c, const struct air_inst *in);
-
 static bool
 texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
@@ -1614,8 +1581,6 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    struct air_ptr tex;
    if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
       return false;
-   if (tex.is_null)
-      return null_texture_result(c, in);
 
    unsigned arg = 2;   /* operands[0] is the callee, [1] the texture */
    struct air_ptr samp = { 0 };
@@ -1941,41 +1906,6 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    return true;
 }
 
-/* air.get_null_texture_<shape>: Metal's null texture. Sampling, reading or
- * gathering one gives zeros, every size of it is zero and a write to it goes
- * nowhere, so it needs no binding at all: it is a texture pointer marked null
- * (air_ptr.is_null), and texture_op answers what is done with it here.
- * CoreAnimation's compositing shader takes one for every image, attachment and
- * lookup table a pipeline has not got -- usually on paths its function
- * constants make dead, but not always. A binding would not have fitted
- * anyway: that shader's own textures already fill the sixteen slots a stage
- * has.
- */
-static bool
-null_texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
-{
-   if (strncmp(n->part[0], "get_null_texture_", 17))
-      return air_error(c, "intrinsic: air.%s", n->part[0]);
-   air_set(c, &in->base, air_val_ptr(c, (struct air_ptr){ .class = AIR_PTR_TEXTURE,
-                                                         .is_null = true }));
-   return true;
-}
-
-/* What an operation on the null texture gives: zeros of its result, nothing for
- * a write. */
-static bool
-null_texture_result(struct air_ctx *c, const struct air_inst *in)
-{
-   const struct air_type *rt = in->base.type;
-   if (rt->kind == AIR_TYPE_VOID)
-      return true;
-   const struct air_type *vt = rt->kind == AIR_TYPE_STRUCT && rt->num_members ? rt->members[0]
-                                                                            : rt;
-   nir_def *zero = nir_imm_zero(&c->b, air_nir_components(vt), air_nir_bit_size(c, vt));
-   set_tex_result(c, in, zero);
-   return true;
-}
-
 /* -- the dispatcher ----------------------------------------------------- */
 
 bool
@@ -1999,8 +1929,6 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))
       return discard_op(c, in);
-   if (!strncmp(n.part[0], "get_null_texture", 16))
-      return null_texture_op(c, in, &n);
 
    bool handled = false;
    /* before math_op, which resolves every argument as a number: these take a

@@ -16,9 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "nir_constant_expressions.h"
 #include "util/hash_table.h"
-#include "util/set.h"
 #include "util/u_math.h"
 
 bool
@@ -104,8 +102,7 @@ val_is_pointerish(const struct air_val *v)
 static bool
 same_ptr(const struct air_ptr *a, const struct air_ptr *b)
 {
-   if (a->class != b->class || a->binding != b->binding || a->is_image != b->is_image ||
-       a->is_null != b->is_null)
+   if (a->class != b->class || a->binding != b->binding || a->is_image != b->is_image)
       return false;
    if (a->offset == b->offset)
       return true;
@@ -151,11 +148,6 @@ air_nir_bit_size(struct air_ctx *c, const struct air_type *t)
     * returned so that the instruction under construction stays well formed
     * while the error just set discards the shader.
     */
-   /* An integer of a width NIR does not have is held in the next one it has: see
-    * odd_int_bits below, and the operations that keep it in that form. */
-   if (bits > 1 && bits < 64 && air_type_scalar(t)->kind == AIR_TYPE_INT &&
-       bits != 8 && bits != 16 && bits != 32)
-      return bits <= 8 ? 8 : bits <= 16 ? 16 : bits <= 32 ? 32 : 64;
    if (bits != 1 && bits != 8 && bits != 16 && bits != 32 && bits != 64) {
       /* Zero is a different fact wearing the same symptom, and saying so in one
        * message made 79 modules read as carrying a 0-bit integer when what they
@@ -184,66 +176,6 @@ unsigned
 air_nir_components(const struct air_type *t)
 {
    return t->kind == AIR_TYPE_VECTOR ? t->count : 1;
-}
-
-/*
- * INTEGERS OF A WIDTH NIR DOES NOT HAVE: i2 to i63 other than i8, i16 and i32. RenderBox
- * -- the widgets' renderer -- switches on 3- and 4-bit fields of its state word
- * (`trunc i32 %6 to i4`, then `switch i4`) and carries 2- to 10-bit integers through its
- * blending, and 24 of its 47 shaders stopped at the first one. Such a value is held in
- * the next width NIR has (air_nir_bit_size), zero-extended: the bits above its own are
- * always 0. The operations that could set them clear them again (odd_int_fix: add, sub,
- * mul, shl, trunc, float to integer, a load), the ones that read the value as signed
- * sign-extend it from its own top bit first (odd_int_sext: sdiv, srem, ashr, the signed
- * compares, sext, sitofp), and the rest -- and, or, xor, udiv, urem, lshr, the unsigned
- * and equality compares, zext, select, phi, switch -- are exact on that form as they
- * stand. Constants are made in it. A load or store whose holding width is wider than
- * LLVM's store size for the type (an i24 in 32 bits) is refused: it would touch a byte
- * that is not the value's.
- *
- * Returns the width, or 0 for an integer of a width NIR has (and anything else).
- */
-static unsigned
-odd_int_bits(const struct air_type *t)
-{
-   const struct air_type *s = t ? air_type_scalar(t) : NULL;
-   if (!s || s->kind != AIR_TYPE_INT)
-      return 0;
-   unsigned n = air_type_bit_size(s);
-   return n > 1 && n < 64 && n != 8 && n != 16 && n != 32 ? n : 0;
-}
-
-/* the bits above an n-bit integer's own cleared (n 0: unchanged) */
-static nir_def *
-odd_int_fix(struct air_ctx *c, nir_def *x, unsigned n)
-{
-   return n ? nir_iand_imm(&c->b, x, (1ull << n) - 1) : x;
-}
-
-/* an n-bit integer as a signed number of its holding width (n 0: unchanged) */
-static nir_def *
-odd_int_sext(struct air_ctx *c, nir_def *x, unsigned n)
-{
-   if (!n)
-      return x;
-   unsigned w = x->bit_size;
-   return nir_ishr_imm(&c->b, nir_ishl_imm(&c->b, x, w - n), w - n);
-}
-
-/* An index, of whatever integer type, as the 32-bit number NIR's operations take. LLVM
- * reads an extractelement or insertelement index as unsigned and a getelementptr index
- * as signed, whatever its width; and a 1-bit one is a bool in NIR, which has no u2u or
- * i2i at all -- RenderBox picks an element of a bool2 by a comparison's result,
- * `extractelement <2 x i1> %v, i1 %c`. */
-static nir_def *
-air_index32(struct air_ctx *c, nir_def *i, const struct air_type *t, bool is_signed)
-{
-   if (i->bit_size == 1)
-      return is_signed ? nir_ineg(&c->b, nir_b2i32(&c->b, i)) : nir_b2i32(&c->b, i);
-   if (!is_signed)
-      return nir_u2u32(&c->b, i);
-   i = odd_int_sext(c, i, odd_int_bits(t));
-   return i->bit_size < 32 ? nir_i2i32(&c->b, i) : nir_u2u32(&c->b, i);
 }
 
 /* The glsl type a NIR function parameter needs to carry a value of this AIR
@@ -355,9 +287,6 @@ scalar_constant(struct air_ctx *c, const struct air_type *t, uint64_t bits)
       default: break;
       }
    }
-   unsigned odd = odd_int_bits(t);
-   if (odd)
-      return nir_imm_intN_t(&c->b, bits & ((1ull << odd) - 1), air_nir_bit_size(c, t));
    return nir_imm_intN_t(&c->b, bits, MAX2(n, 1));
 }
 
@@ -371,24 +300,6 @@ reinterpret_float(struct air_ctx *c, const struct air_type *t, nir_def *bits)
    if (!air_type_is_float(t))
       return bits;
    return nir_mov(&c->b, bits); /* same bits, and NIR tracks the type by use */
-}
-
-/* An undefined struct or array: its fields stay NONE until insertvalue puts something
- * there, and a field that is itself a struct or an array is one of these too, so that an
- * insertvalue with an index path finds its slot -- RenderBox builds a [3 x [2 x float]]
- * argument out of `insertvalue [3 x [2 x float]] undef, float %8, 0, 0` and five more.
- */
-static struct air_val *
-undef_agg(struct air_ctx *c, const struct air_type *t)
-{
-   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
-   struct air_val *v = air_val_agg(c, n);
-   for (unsigned i = 0; i < n; i++) {
-      const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
-      if (et && (et->kind == AIR_TYPE_STRUCT || et->kind == AIR_TYPE_ARRAY))
-         v->elems[i] = undef_agg(c, et);
-   }
-   return v;
 }
 
 static struct air_val *
@@ -422,8 +333,12 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
 
    case AIR_CONST_UNDEF:
    case AIR_CONST_POISON:
-      if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY)
-         return undef_agg(c, t);
+      if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+         unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+         struct air_val *v = air_val_agg(c, n);
+         /* fields stay NONE until insertvalue puts something there */
+         return v;
+      }
       if (t->kind == AIR_TYPE_POINTER) {
          struct air_ptr p = { .class = AIR_PTR_NONE, .pointee = t->elem };
          return air_val_ptr(c, p);
@@ -577,122 +492,6 @@ ptr_offset(struct air_ctx *c, struct air_ptr ptr)
    return ptr.offset ? ptr.offset : nir_imm_int(&c->b, 0);
 }
 
-/*
- * A VALUE KNOWN WHILE TRANSLATING: a constant, or arithmetic on constants,
- * evaluated here rather than left for NIR's constant folding -- because what
- * depends on it is decided here: which of two pointers a select names, and
- * which edges of a branch can be taken at all. The function constants and the
- * variables the static initializers leave (air_partial.c) are constants by the
- * time the body reads them, so the conditions built out of them are too.
- */
-static bool
-air_const_eval(nir_def *d, nir_const_value *out, unsigned depth)
-{
-   if (depth > 32)
-      return false;
-   nir_instr *instr = d->parent_instr;
-   if (instr->type == nir_instr_type_load_const) {
-      nir_load_const_instr *lc = nir_instr_as_load_const(instr);
-      memcpy(out, lc->value, sizeof(nir_const_value) * d->num_components);
-      return true;
-   }
-   if (instr->type != nir_instr_type_alu)
-      return false;
-   nir_alu_instr *alu = nir_instr_as_alu(instr);
-   const nir_op_info *info = &nir_op_infos[alu->op];
-   nir_const_value src[NIR_ALU_MAX_INPUTS][NIR_MAX_VEC_COMPONENTS];
-   nir_const_value *srcs[NIR_ALU_MAX_INPUTS];
-   unsigned bit_size = 0;
-   for (unsigned i = 0; i < info->num_inputs; i++) {
-      nir_const_value v[NIR_MAX_VEC_COMPONENTS];
-      if (!air_const_eval(alu->src[i].src.ssa, v, depth + 1))
-         return false;
-      unsigned n = nir_ssa_alu_instr_src_components(alu, i);
-      for (unsigned j = 0; j < n; j++)
-         src[i][j] = v[alu->src[i].swizzle[j]];
-      srcs[i] = src[i];
-      if (!info->input_sizes[i] && !bit_size)
-         bit_size = alu->src[i].src.ssa->bit_size;
-   }
-   if (!bit_size)
-      bit_size = alu->def.bit_size;
-   nir_eval_const_opcode(alu->op, out, alu->def.num_components, bit_size, srcs, 0);
-   return true;
-}
-
-/* a scalar condition known while translating */
-static bool
-air_const_bool(nir_def *d, bool *out)
-{
-   nir_const_value v[NIR_MAX_VEC_COMPONENTS];
-   if (!d || d->num_components != 1 || !air_const_eval(d, v, 0))
-      return false;
-   *out = d->bit_size == 1 ? v[0].b : v[0].u64 != 0;
-   return true;
-}
-
-/* a byte offset known while translating */
-static bool
-air_const_offset(nir_def *d, uint64_t *out)
-{
-   if (!d) {
-      *out = 0;
-      return true;
-   }
-   nir_const_value v[NIR_MAX_VEC_COMPONENTS];
-   if (d->num_components != 1 || !air_const_eval(d, v, 0))
-      return false;
-   *out = nir_const_value_as_uint(v[0], d->bit_size);
-   return true;
-}
-
-/* POINTERS IN MEMORY: see air_ctx.ptr_slots. */
-void
-air_remember_pointer(struct air_ctx *c, unsigned offset, struct air_val *val)
-{
-   if (!c->ptr_slots || c->ptr_slots_impl != c->b.impl) {
-      c->ptr_slots = _mesa_pointer_hash_table_create(c->mem_ctx);
-      c->ptr_slots_impl = c->b.impl;
-   }
-   _mesa_hash_table_insert(c->ptr_slots, (void *)(uintptr_t)(offset + 1), val);
-}
-
-static struct air_val *
-air_recall_pointer(struct air_ctx *c, unsigned offset)
-{
-   if (!c->ptr_slots || c->ptr_slots_impl != c->b.impl)
-      return NULL;
-   struct hash_entry *e = _mesa_hash_table_search(c->ptr_slots, (void *)(uintptr_t)(offset + 1));
-   return e ? e->data : NULL;
-}
-
-static void
-air_forget_pointer(struct air_ctx *c, unsigned offset)
-{
-   if (!c->ptr_slots || c->ptr_slots_impl != c->b.impl)
-      return;
-   struct hash_entry *e = _mesa_hash_table_search(c->ptr_slots, (void *)(uintptr_t)(offset + 1));
-   if (e)
-      _mesa_hash_table_remove(c->ptr_slots, e);
-}
-
-/* The pointer a known variable holds at a byte offset of the constant data, or
- * NULL: the static initializer's pointer cells (air_known_ptr), found by the
- * variable the offset falls in.
- */
-static struct air_val *
-air_known_pointer(struct air_ctx *c, uint64_t offset)
-{
-   for (unsigned p = 0; p < c->known.num_ptrs; p++) {
-      const struct air_known_ptr *kp = &c->known.ptrs[p];
-      const struct air_global_plan *pl = &c->global_plan[kp->global];
-      if (!pl->known || pl->offset + kp->offset != offset)
-         continue;
-      return air_get(c, &c->m->globals[kp->target]->base);
-   }
-   return NULL;
-}
-
 nir_def *
 air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type, unsigned align)
 {
@@ -700,10 +499,6 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
    unsigned bits = air_nir_bit_size(c, type);
    if (type->kind == AIR_TYPE_POINTER)
       return air_error(c, "instruction: a pointer loaded from memory (argument buffers)"), NULL;
-   unsigned odd = odd_int_bits(type);
-   if (odd && DIV_ROUND_UP(odd, 8) * 8 != bits)
-      return air_error(c, "instruction: a load of an i%u, which is held in %u bits and "
-                          "stored in %u bytes", odd, bits, DIV_ROUND_UP(odd, 8)), NULL;
    if (!align)
       align = MAX2(bits / 8, 1);
 
@@ -729,37 +524,18 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
    case AIR_PTR_SCRATCH:
       res = nir_load_scratch(&c->b, comps, bits, off, .align_mul = align);
       break;
-   case AIR_PTR_CONSTANT_DATA: {
-      /* at a constant offset, the bytes themselves: what is decided while
-       * translating has to see a constant here (air_const_eval) */
-      uint64_t at;
-      unsigned bytes = bits / 8;
-      if (air_const_offset(ptr.offset, &at) &&
-          at + (uint64_t)comps * bytes <= c->nir->constant_data_size && bits >= 8) {
-         nir_const_value v[NIR_MAX_VEC_COMPONENTS];
-         memset(v, 0, sizeof(v));
-         for (unsigned i = 0; i < comps; i++)
-            memcpy(&v[i].u64, (const uint8_t *)c->nir->constant_data + at + i * bytes, bytes);
-         res = nir_build_imm(&c->b, comps, bits, v);
-         break;
-      }
+   case AIR_PTR_CONSTANT_DATA:
       res = nir_load_constant(&c->b, comps, bits, off, .base = 0, .range = c->nir->constant_data_size,
                               .align_mul = align);
       break;
-   }
    case AIR_PTR_FUNCTION_CONSTANT: {
       /* its value is known at pipeline creation, so the load is that value */
       const struct air_constant_value *v = NULL;
       for (unsigned i = 0; c->options && i < c->options->num_constants; i++)
          if (c->options->constants[i].index == ptr.binding)
             v = &c->options->constants[i];
-      /* A constant the pipeline gave no value: Metal leaves it undefined, and a
-       * shader reads one only under air.is_function_constant_defined, which
-       * answers false for it. Zero is a value of the type and keeps the code
-       * that discards it well formed. */
-      static const struct air_constant_value zero = { 0 };
       if (!v)
-         v = &zero;
+         return air_error(c, "interface: function constant %u has no value", ptr.binding), NULL;
       if (comps == 1) {
          res = nir_imm_intN_t(&c->b, v->bits, as_bool ? 8 : bits);
          break;
@@ -803,7 +579,7 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
       return air_error(c, "instruction: a load through a %s pointer",
                        ptr.class == AIR_PTR_NONE ? "null" : "texture or sampler"), NULL;
    }
-   return as_bool ? nir_ine_imm(&c->b, res, 0) : odd_int_fix(c, res, odd);
+   return as_bool ? nir_ine_imm(&c->b, res, 0) : res;
 }
 
 bool
@@ -2292,48 +2068,6 @@ load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type 
    return nir_bcsel(&c->b, v->def, a, b);
 }
 
-/* A POINTER loaded from memory, which here means a pointer something put
- * there while translating: a store into a local (air_ctx.ptr_slots), or a known
- * variable's initializer (air_known_pointer). Through a pointer chosen at run
- * time, both sides, unless the choice is known.
- */
-static struct air_val *
-load_pointer(struct air_ctx *c, struct air_val *p)
-{
-   if (p->kind == AIR_VAL_PTR_SELECT) {
-      bool which;
-      if (air_const_bool(p->def, &which))
-         return load_pointer(c, p->elems[which ? 0 : 1]);
-      struct air_val *a = load_pointer(c, p->elems[0]);
-      struct air_val *b = load_pointer(c, p->elems[1]);
-      if (!a || !b)
-         return NULL;
-      if (a->kind == AIR_VAL_PTR && b->kind == AIR_VAL_PTR && same_ptr(&a->ptr, &b->ptr))
-         return a;
-      return air_val_ptr_select(c, p->def, a, b);
-   }
-   if (p->kind != AIR_VAL_PTR) {
-      air_error(c, "instruction: a load from something that is not a pointer");
-      return NULL;
-   }
-   uint64_t at;
-   if (p->ptr.class == AIR_PTR_SCRATCH && air_const_offset(p->ptr.offset, &at)) {
-      struct air_val *v = air_recall_pointer(c, (unsigned)at);
-      if (v)
-         return v;
-      air_error(c, "instruction: a pointer loaded from a local that no pointer was stored "
-                   "into");
-      return NULL;
-   }
-   if (p->ptr.class == AIR_PTR_CONSTANT_DATA && air_const_offset(p->ptr.offset, &at)) {
-      struct air_val *v = air_known_pointer(c, at);
-      if (v)
-         return v;
-   }
-   air_error(c, "instruction: a pointer loaded from memory (argument buffers)");
-   return NULL;
-}
-
 static bool
 gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
          struct air_val **out)
@@ -2386,8 +2120,7 @@ gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
       } else if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_VECTOR) {
          uint64_t es = t->kind == AIR_TYPE_ARRAY ? air_type_alloc_size(c->m, t->elem)
                                                  : MAX2(air_type_bit_size(t->elem) / 8, 1);
-         p = air_ptr_add(c, p, nir_imul_imm(&c->b, air_index32(c, idx, in->operands[i]->type,
-                                                               true), es));
+         p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, idx), es));
          t = t->elem;
       } else {
          return air_error(c, "instruction: getelementptr into a scalar");
@@ -2420,14 +2153,6 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
       return false;
    bool is_float = air_type_is_float(air_type_scalar(in->base.type));
    nir_def *res;
-   /* an integer of a width NIR does not have (odd_int_bits): signed in, cleared out */
-   unsigned odd = is_float ? 0 : odd_int_bits(in->base.type);
-   if (odd && (in->sub == AIR_BINOP_SDIV || in->sub == AIR_BINOP_SREM)) {
-      x = odd_int_sext(c, x, odd);
-      y = odd_int_sext(c, y, odd);
-   } else if (odd && in->sub == AIR_BINOP_ASHR) {
-      x = odd_int_sext(c, x, odd);
-   }
 
    /* Metal compiles with fast math on, and the modules say so per
     * instruction. Without the flags the arithmetic must not be reassociated,
@@ -2456,10 +2181,6 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
       return air_error(c, "instruction: binary operator %u", in->sub);
    }
    c->b.exact = was_exact;
-   if (odd && in->sub != AIR_BINOP_AND && in->sub != AIR_BINOP_OR &&
-       in->sub != AIR_BINOP_XOR && in->sub != AIR_BINOP_UDIV &&
-       in->sub != AIR_BINOP_UREM && in->sub != AIR_BINOP_LSHR)
-      res = odd_int_fix(c, res, odd);
    air_set(c, &in->base, air_val_ssa(c, res));
    return true;
 }
@@ -2484,18 +2205,6 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
    if (!x)
       return false;
    unsigned bits = air_nir_bit_size(c, dt);
-   /* integers of a width NIR does not have (odd_int_bits): read as signed where the
-    * cast does, and cleared above their own width where it can set those bits */
-   unsigned dodd = odd_int_bits(dt), sodd = odd_int_bits(st);
-   if (sodd && (in->sub == AIR_CAST_SEXT || in->sub == AIR_CAST_SITOFP))
-      x = odd_int_sext(c, x, sodd);
-   if ((dodd || sodd) && in->sub == AIR_CAST_BITCAST &&
-       (dodd != sodd || air_nir_components(dt) != air_nir_components(st)))
-      return air_error(c, "instruction: a bitcast between %u x i%u and %u x i%u, which "
-                          "this frontend does not repack", air_nir_components(st),
-                       sodd ? sodd : air_type_bit_size(air_type_scalar(st)),
-                       air_nir_components(dt),
-                       dodd ? dodd : air_type_bit_size(air_type_scalar(dt)));
    nir_def *res;
    switch (in->sub) {
    case AIR_CAST_TRUNC:
@@ -2587,9 +2296,6 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
    default:
       return air_error(c, "instruction: cast %u", in->sub);
    }
-   if (dodd && (in->sub == AIR_CAST_TRUNC || in->sub == AIR_CAST_SEXT ||
-                in->sub == AIR_CAST_FPTOUI || in->sub == AIR_CAST_FPTOSI))
-      res = odd_int_fix(c, res, dodd);
    air_set(c, &in->base, air_val_ssa(c, res));
    return true;
 }
@@ -2601,13 +2307,6 @@ translate_cmp(struct air_ctx *c, const struct air_inst *in)
    nir_def *y = air_get_ssa(c, in->operands[1]);
    if (!x || !y)
       return false;
-   /* the signed compares read an integer of a width NIR does not have as signed */
-   unsigned odd = odd_int_bits(in->operands[0]->type);
-   if (odd && (in->sub == AIR_ICMP_SGT || in->sub == AIR_ICMP_SGE ||
-               in->sub == AIR_ICMP_SLT || in->sub == AIR_ICMP_SLE)) {
-      x = odd_int_sext(c, x, odd);
-      y = odd_int_sext(c, y, odd);
-   }
    nir_def *res;
    switch (in->sub) {
    /* NaN never appears in these shaders (nnan is set on every one), so the
@@ -2769,12 +2468,6 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             return false;
          if (pc->num_components != 1)
             return air_error(c, "instruction: a vector select between pointers");
-         /* a condition known while translating is no choice at all */
-         bool which;
-         if (air_const_bool(pc, &which)) {
-            air_set(c, &in->base, which ? pa : pb);
-            return true;
-         }
          air_set(c, &in->base, air_val_ptr_select(c, pc, pa, pb));
          return true;
       }
@@ -2793,8 +2486,7 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[1]);
       if (!v || !i)
          return false;
-      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v,
-                                 air_index32(c, i, in->operands[1]->type, false))));
+      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v, nir_u2u32(&c->b, i))));
       return true;
    }
    case AIR_OP_INSERTELT: {
@@ -2803,19 +2495,11 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[2]);
       if (!v || !x || !i)
          return false;
-      /* an index known while translating -- a function constant's, through
-       * the initializers' variables -- is an immediate; any other is NIR's
-       * select-per-component form, which constant folding undoes once it can */
-      uint64_t at;
-      if (air_const_offset(i, &at)) {
-         if (at >= v->num_components)
-            return air_error(c, "instruction: insertelement at index %llu of a vector of %u",
-                             (unsigned long long)at, v->num_components);
-         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x, (unsigned)at)));
-         return true;
-      }
-      air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x,
-                                 air_index32(c, i, in->operands[2]->type, false))));
+      if (!nir_src_is_const(nir_src_for_ssa(i)))
+         return air_error(c, "instruction: insertelement at a run-time index");
+      air_set(c, &in->base,
+              air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x,
+                                                   nir_src_as_uint(nir_src_for_ssa(i)))));
       return true;
    }
    case AIR_OP_SHUFFLEVEC: {
@@ -2935,17 +2619,6 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *p = air_get(c, in->operands[0]);
       if (!p)
          return false;
-      /* A POINTER loaded from memory: what a store left in a local, or what a
-       * known variable's initializer holds (load_pointer). An argument buffer's
-       * member resolves below, as before. */
-      if (in->base.type->kind == AIR_TYPE_POINTER &&
-          !(p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_ARGBUF)) {
-         struct air_val *r = load_pointer(c, p);
-         if (!r)
-            return false;
-         air_set(c, &in->base, r);
-         return true;
-      }
       if (p->kind == AIR_VAL_PTR_SELECT) {
          nir_def *res = load_through_choice(c, p, in->base.type, in->align);
          if (!res)
@@ -2986,19 +2659,9 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *sv = air_get(c, in->operands[0]);
       if (!sv)
          return false;
-      if (val_is_pointerish(sv)) {
-         /* Into a local at a constant offset, it is remembered instead
-          * (air_ctx.ptr_slots): CoreAnimation's compositing shader keeps its
-          * two sampler arguments in locals that way and loads them back. */
-         uint64_t at;
-         if (p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_SCRATCH &&
-             air_const_offset(p->ptr.offset, &at)) {
-            air_remember_pointer(c, (unsigned)at, sv);
-            return true;
-         }
+      if (val_is_pointerish(sv))
          return air_error(c, "instruction: a store of a pointer into memory, which this "
                              "frontend has no address to write");
-      }
       if (p->kind == AIR_VAL_PTR_SELECT)
          return air_error(c, "instruction: a store through a chosen pointer, which would "
                              "have to write both of them");
@@ -3007,14 +2670,6 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
          return false;
       if (p->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a store to something that is not a pointer");
-      unsigned odd = odd_int_bits(in->operands[0]->type);
-      if (odd && DIV_ROUND_UP(odd, 8) * 8 != v->bit_size)
-         return air_error(c, "instruction: a store of an i%u, which is held in %u bits and "
-                             "stored in %u bytes", odd, v->bit_size, DIV_ROUND_UP(odd, 8));
-      /* a number over a remembered pointer: the pointer is gone */
-      uint64_t stored_at;
-      if (p->ptr.class == AIR_PTR_SCRATCH && air_const_offset(p->ptr.offset, &stored_at))
-         air_forget_pointer(c, (unsigned)stored_at);
       return air_store_ptr(c, p->ptr, v, in->align);
    }
    case AIR_OP_CALL: {
@@ -3049,17 +2704,6 @@ nir_block_of(struct air_ctx *c, const struct air_block *b)
    return n;
 }
 
-/* A value as the variable it goes into holds it. NIR has no 1-bit variable, so a bool
- * the shader returns -- RenderBox's stroke vertex shader has a `bool2` output, its caps,
- * and a function of a module may return one -- is declared as the integer it travels as,
- * and the value is widened to it here. */
-static nir_def *
-as_var_width(struct air_ctx *c, nir_def *d, const struct glsl_type *t)
-{
-   unsigned w = glsl_get_bit_size(glsl_without_array(t));
-   return d->bit_size == 1 && w > 1 ? nir_b2iN(&c->b, d, w) : d;
-}
-
 static bool
 emit_return(struct air_ctx *c, const struct air_inst *in)
 {
@@ -3091,7 +2735,7 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
          if (v->elems[i]->kind != AIR_VAL_SSA)
             return air_error(c, "instruction: field %u of a returned struct is not a "
                                 "number, from a function called in the module", i);
-         nir_def *d = as_var_width(c, v->elems[i]->def, c->ret_fields[i]->type);
+         nir_def *d = v->elems[i]->def;
          nir_store_deref(&c->b, c->ret_fields[i], d,
                          nir_component_mask(d->num_components));
       }
@@ -3102,7 +2746,6 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
       if (!d)
          return air_error(c, "instruction: a return of a value this cannot put in a "
                              "register, from a function called in the module");
-      d = as_var_width(c, d, c->ret_deref->type);
       nir_store_deref(&c->b, c->ret_deref, d, nir_component_mask(d->num_components));
       return true;
    }
@@ -3116,8 +2759,7 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
             return air_error(c, "interface: field %u of the result has no output", i);
          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
             continue; /* a field left undef is a target nothing writes */
-         nir_store_var(&c->b, c->outputs[i].var,
-                       as_var_width(c, v->elems[i]->def, c->outputs[i].var->type),
+         nir_store_var(&c->b, c->outputs[i].var, v->elems[i]->def,
                        BITFIELD_MASK(v->elems[i]->def->num_components));
       }
       return true;
@@ -3126,8 +2768,7 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
       return air_error(c, "instruction: a returned value that is not a number");
    if (!c->num_outputs || !c->outputs[0].var)
       return air_error(c, "interface: a returned value with no output");
-   nir_store_var(&c->b, c->outputs[0].var, as_var_width(c, v->def, c->outputs[0].var->type),
-                 BITFIELD_MASK(v->def->num_components));
+   nir_store_var(&c->b, c->outputs[0].var, v->def, BITFIELD_MASK(v->def->num_components));
    return true;
 }
 
@@ -3210,147 +2851,48 @@ val_holds_ptr(const struct air_val *v)
  * phis are all keyed on this function's own objects, and leaving the caller's
  * entries in place would let a callee resolve a value it cannot see.
  */
-/*
- * WHAT A CALLEE IS GIVEN OF A STRUCT OR A POINTER ARGUMENT. Neither is one NIR value
- * here: a pointer is a resolution (its class, binding and pointee) with a byte offset,
- * and a struct is a tree of values (struct air_val). So the callee is specialised to the
- * caller's tree, and every def of the CALLER's impl inside it -- a number, or an offset
- * computed at run time -- goes over as a NIR parameter of its own, which
- * nir_inline_functions replaces by the caller's def. Using the caller's def in the
- * callee directly would be the cross-function def/use the globals once caused. A
- * constant offset is rebuilt in the callee instead, so that it is still a constant
- * there: a pointer stored in a local is found again by that constant (air_ctx.ptr_slots).
- *
- * Who needs it: RenderBox's path shaders hand a local struct (an alloca: scratch at an
- * offset) to the function that fills or reads it and pass their globals as a struct of
- * arrays by value, and MPS's Gaussian blur keeps its texture in a local struct that its
- * sample function reads the texture back out of.
- */
-
-/* A constant offset, built where this function's constants go (c->const_cursor), so that
- * every block of it can use it. */
-static nir_def *
-air_imm_offset(struct air_ctx *c, uint64_t value, unsigned bit_size)
-{
-   nir_cursor use = c->b.cursor;
-   c->b.cursor = c->const_cursor;
-   nir_def *d = nir_imm_intN_t(&c->b, value, bit_size);
-   c->const_cursor = c->b.cursor;
-   c->b.cursor = use;
-   return d;
-}
-
-/* The defs of the caller's a tree hands over as parameters, in the order both sides walk
- * them; with defs NULL only counted. False for a tree that cannot be handed over at all: a
- * pointer chosen at run time, whose condition is the caller's and which a slot cannot hold.
- */
-static bool
-arg_defs(const struct air_val *v, nir_def **defs, unsigned *n)
-{
-   if (!v)
-      return true;
-   uint64_t at;
-   switch (v->kind) {
-   case AIR_VAL_NONE:
-      return true;
-   case AIR_VAL_SSA:
-      if (defs)
-         defs[*n] = v->def;
-      (*n)++;
-      return true;
-   case AIR_VAL_PTR:
-      if (!v->ptr.offset || air_const_offset(v->ptr.offset, &at))
-         return true;
-      if (defs)
-         defs[*n] = v->ptr.offset;
-      (*n)++;
-      return true;
-   case AIR_VAL_AGG:
-      for (unsigned i = 0; i < v->num_elems; i++)
-         if (!arg_defs(v->elems[i], defs, n))
-            return false;
-      return true;
-   default:
-      return false;
-   }
-}
-
-/* The caller's tree in the function being translated, its defs from the parameters at
- * *pidx on (arg_defs' order). */
-static struct air_val *
-arg_in_callee(struct air_ctx *c, const struct air_val *v, unsigned *pidx)
-{
-   if (!v)
-      return NULL;
-   uint64_t at;
-   switch (v->kind) {
-   case AIR_VAL_SSA:
-      return air_val_ssa(c, nir_load_param(&c->b, (*pidx)++));
-   case AIR_VAL_PTR: {
-      struct air_val *n = clone_val(c, v);
-      if (v->ptr.offset)
-         n->ptr.offset = air_const_offset(v->ptr.offset, &at)
-                            ? air_imm_offset(c, at, v->ptr.offset->bit_size)
-                            : nir_load_param(&c->b, (*pidx)++);
-      return n;
-   }
-   case AIR_VAL_AGG: {
-      struct air_val *n = air_val_agg(c, v->num_elems);
-      for (unsigned i = 0; i < v->num_elems; i++)
-         n->elems[i] = arg_in_callee(c, v->elems[i], pidx);
-      return n;
-   }
-   default:
-      return clone_val(c, v);
-   }
-}
-
-/* A pointer remembered in a local of another function, as this one can hold it: the same
- * resolution with a constant offset rebuilt here, or NULL for one that carries a def. */
-static struct air_val *
-slot_here(struct air_ctx *c, const struct air_val *v)
-{
-   uint64_t at;
-   if (!v || v->kind != AIR_VAL_PTR)
-      return NULL;
-   if (v->ptr.offset && !air_const_offset(v->ptr.offset, &at))
-      return NULL;
-   struct air_val *n = clone_val(c, v);
-   if (v->ptr.offset)
-      n->ptr.offset = air_imm_offset(c, at, v->ptr.offset->bit_size);
-   return n;
-}
-
 static nir_function *
 translate_callee(struct air_ctx *c, const struct air_function *f,
                  struct air_val **argv, bool *is_param)
 {
    /* A texture, sampler or buffer argument is not a value in this frontend: it
     * is resolved at translation time into a binding, and tex_handle wants an
-    * AIR_VAL_PTR rather than an SSA def. Such an argument, and a struct, is
-    * handed over as a tree (arg_defs, above), which specialises the callee to
-    * its call site -- so it is not cached. CoreImage passes a texture and a
-    * sampler as metal::texture2d and metal::sampler, one-field structs wrapping
-    * the address-space-1 and -2 pointers; passing such a struct as one NIR value
-    * would hand the callee something it then takes extractvalue of.
+    * AIR_VAL_PTR rather than an SSA def. Such an argument is bound from the
+    * caller's own resolution and takes no NIR parameter, which specialises the
+    * callee to its call site -- so it is not cached. Each of the four modules
+    * that needs this has exactly one call site, counted beforehand.
+    *
+    * A pointer carrying a byte offset is refused instead: that offset is an
+    * nir_def of the CALLER's impl, and using it here would be the same
+    * cross-function def/use that the globals used to cause.
     */
    bool specialised = false;
-   unsigned tree_params = 0;
    for (unsigned i = 0; i < f->num_args; i++) {
-      bool tree = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
-                                      argv[i]->kind == AIR_VAL_AGG ||
-                                      argv[i]->kind == AIR_VAL_PTR_SELECT);
-      /* A chosen pointer's condition is a def of the CALLER's impl, and a
-       * slot's soundness rests on every use being in one block of one function.
+      /* A struct holding a pointer counts as one too: CoreImage passes a
+       * texture and a sampler as metal::texture2d and metal::sampler, which
+       * are one-field structs wrapping the address-space-1 and -2 pointers.
+       * Passing such a struct as a NIR value would hand the callee something
+       * it then takes extractvalue of, and extractvalue of a value that is not
+       * an aggregate here is exactly the error this used to produce.
        */
-      if (tree && !arg_defs(argv[i], NULL, &tree_params)) {
+      bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
+                                     val_holds_ptr(argv[i]));
+      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
+         air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
+                      "argument %u, which would use the caller's own value here", i);
+         return NULL;
+      }
+      /* The same reason, for the two pointers that are values: a chosen
+       * pointer's condition is a def of the CALLER's impl, and a slot's
+       * soundness rests on every use being in one block of one function.
+       */
+      if (argv && argv[i] && argv[i]->kind == AIR_VAL_PTR_SELECT) {
          air_error(c, "intrinsic: a call passing a pointer chosen at run time as "
                       "argument %u", i);
          return NULL;
       }
-      if (is_param)
-         is_param[i] = !tree;
-      specialised |= tree;
+      is_param[i] = !ptr;
+      specialised |= ptr;
    }
 
    struct hash_entry *e = specialised ? NULL : _mesa_hash_table_search(c->fns, f);
@@ -3380,7 +2922,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    } else if (has_ret) {
       nret = 1;
    }
-   unsigned nparams = f->num_args + nret + tree_params;
+   unsigned nparams = f->num_args + nret;
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -3409,25 +2951,15 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       };
    }
    for (unsigned i = 0; i < f->num_args; i++) {
-      if (!is_param[i]) {
-         /* a tree: one parameter per def of the caller's inside it */
-         unsigned n = 0;
-         nir_def **defs = rzalloc_array(c->mem_ctx, nir_def *, MAX2(tree_params, 1));
-         arg_defs(argv[i], defs, &n);
-         for (unsigned k = 0; k < n; k++)
-            fn->params[idx++] = (nir_parameter){
-               .num_components = (uint8_t)defs[k]->num_components,
-               .bit_size = (uint8_t)defs[k]->bit_size,
-            };
+      if (!is_param[i])
          continue;
-      }
       const struct air_type *at = f->args[i].type;
       fn->params[idx++] = (nir_parameter){
          .num_components = (uint8_t)air_nir_components(at),
          .bit_size = (uint8_t)air_nir_bit_size(c, at),
       };
    }
-   fn->num_params = idx;
+   fn->num_params = idx;   /* the pointers took no parameter */
 
    /* cached before the body is translated, so that a callee which calls itself
     * meets its own declaration rather than being translated for ever */
@@ -3447,11 +2979,6 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * constants are built belongs to the function being translated, like the
     * values table above */
    nir_cursor saved_consts = c->const_cursor;
-   /* and so do the pointers remembered in its locals and its dead edges */
-   struct hash_table *saved_slots = c->ptr_slots;
-   nir_function_impl *saved_slots_impl = c->ptr_slots_impl;
-   struct set *saved_dead_edges = c->dead_edges;
-   bool *saved_dead_block = c->dead_block;
 
    c->fn = f;
    c->values = _mesa_pointer_hash_table_create(c->mem_ctx);
@@ -3468,26 +2995,6 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    c->ret_deref = NULL;
    c->ret_fields = NULL;
    c->num_ret_fields = 0;
-
-   /* The pointers the caller keeps in its locals, for a callee specialised to its call
-    * site: through a pointer argument this function reads the caller's locals, and a
-    * pointer stored there is a slot and not bytes. MPS's Gaussian blur keeps its texture
-    * in a local struct and its sample function loads it back out. A cached callee is
-    * translated once for all its call sites and starts with none, as before. */
-   struct hash_table *caller_slots =
-      specialised && saved_slots && saved_slots_impl == saved_b.impl ? saved_slots : NULL;
-   struct set *handed = caller_slots ? _mesa_pointer_set_create(c->mem_ctx) : NULL;
-   c->ptr_slots = NULL;
-   c->ptr_slots_impl = NULL;
-   if (caller_slots) {
-      hash_table_foreach(caller_slots, he) {
-         struct air_val *v = slot_here(c, he->data);
-         if (!v)
-            continue;
-         air_remember_pointer(c, (unsigned)((uintptr_t)he->key - 1), v);
-         _mesa_set_add(handed, he->key);
-      }
-   }
 
    /* this function's own globals, built in its own builder */
    materialise_globals(c);
@@ -3517,15 +3024,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    unsigned pidx = nret;
    for (unsigned i = 0; i < f->num_args && ok; i++) {
       if (!is_param[i]) {
-         air_set(c, &f->args[i], arg_in_callee(c, argv[i], &pidx));
+         air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
          continue;
       }
       air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));
    }
    if (ok)
       ok = translate_body(c);
-   struct hash_table *callee_slots =
-      c->ptr_slots && c->ptr_slots_impl == c->b.impl ? c->ptr_slots : NULL;
 
    c->b = saved_b;
    c->fn = saved_fn;
@@ -3537,47 +3042,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    c->ret_deref = saved_ret;
    c->ret_fields = saved_ret_fields;
    c->num_ret_fields = saved_num_ret_fields;
-   c->ptr_slots = saved_slots;
-   c->ptr_slots_impl = saved_slots_impl;
-   c->dead_edges = saved_dead_edges;
-   c->dead_block = saved_dead_block;
-
-   /* ... and back: what the callee left in the slots it was handed is what the caller
-    * finds after the call. A slot it overwrote with a number is gone, and one it stored
-    * a pointer into holds that pointer, if the pointer carries no def of the callee's. */
-   if (ok && caller_slots) {
-      set_foreach(handed, se) {
-         if (!callee_slots || !_mesa_hash_table_search(callee_slots, se->key))
-            air_forget_pointer(c, (unsigned)((uintptr_t)se->key - 1));
-      }
-      if (callee_slots) {
-         hash_table_foreach(callee_slots, he) {
-            unsigned at = (unsigned)((uintptr_t)he->key - 1);
-            struct air_val *v = slot_here(c, he->data);
-            if (v)
-               air_remember_pointer(c, at, v);
-            else
-               air_forget_pointer(c, at);
-         }
-      }
-   }
    return ok ? fn : NULL;
-}
-
-/* A tree argument's defs as the call's parameters from `idx` on (arg_defs' order, which
- * is the order translate_callee made them in); how many. */
-static unsigned
-call_tree_params(struct air_ctx *c, nir_call_instr *call, unsigned idx,
-                 const struct air_val *v)
-{
-   unsigned n = 0;
-   arg_defs(v, NULL, &n);
-   nir_def **defs = rzalloc_array(c->mem_ctx, nir_def *, MAX2(n, 1));
-   n = 0;
-   arg_defs(v, defs, &n);
-   for (unsigned k = 0; k < n; k++)
-      call->params[idx + k] = nir_src_for_ssa(defs[k]);
-   return n;
 }
 
 /* A call of a function this module defines. The callee is translated as a
@@ -3653,10 +3118,8 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    }
    /* operand 0 is the callee; the arguments follow it */
    for (unsigned i = 0; i < f->num_args; i++) {
-      if (!is_param[i]) {
-         idx += call_tree_params(c, call, idx, argv[i]);
+      if (!is_param[i])
          continue;
-      }
       nir_def *a = air_get_ssa(c, in->operands[i + 1]);
       if (!a)
          return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
@@ -3665,23 +3128,14 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    }
    nir_builder_instr_insert(&c->b, &call->instr);
 
-   /* and a bool comes back as the integer it travelled as (as_var_width) */
    if (ret_struct) {
       struct air_val *agg = air_val_agg(c, rt->num_members);
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!fields[i])
-            continue;
-         nir_def *d = nir_load_var(&c->b, fields[i]);
-         if (air_nir_bit_size(c, rt->members[i]) == 1)
-            d = nir_ine_imm(&c->b, d, 0);
-         agg->elems[i] = air_val_ssa(c, d);
-      }
+      for (unsigned i = 0; i < rt->num_members; i++)
+         if (fields[i])
+            agg->elems[i] = air_val_ssa(c, nir_load_var(&c->b, fields[i]));
       air_set(c, &in->base, agg);
    } else if (has_ret) {
-      nir_def *d = nir_load_var(&c->b, tmp);
-      if (air_nir_bit_size(c, rt) == 1)
-         d = nir_ine_imm(&c->b, d, 0);
-      air_set(c, &in->base, air_val_ssa(c, d));
+      air_set(c, &in->base, air_val_ssa(c, nir_load_var(&c->b, tmp)));
    }
    return true;
 }
@@ -3856,10 +3310,8 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
        * has no value, which NIR dereferences while adding uses -- a segfault
        * inside nir_instr_insert rather than a message.
        */
-      if (!is_param[i]) {
-         idx += call_tree_params(c, call, idx, argv[i]);
+      if (!is_param[i])
          continue;
-      }
       nir_def *a = argv[i] ? argv[i]->def : NULL;
       if (!a)
          return air_error(c, "library: argument %u has no value to pass", i);
@@ -3899,41 +3351,12 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
  * a missing operand from a reachable block is a refusal and only an edge the
  * entry cannot reach at all is passed over.
  */
-/* EDGES NO BRANCH CAN TAKE: a conditional branch or switch on a condition known
- * while translating keeps one target, and the others' edges are dead. A block
- * all of whose edges in are dead is dead too, and is not translated at all: no
- * value of it can be used anywhere live, because every block it dominates is
- * dead with it, and a phi's operand over a dead edge is not taken.
- */
-static void *
-edge_key(const struct air_block *from, const struct air_block *to)
-{
-   return (void *)(uintptr_t)(((uint64_t)from->index << 24 | to->index) + 1);
-}
-
-static bool
-edge_dead(struct air_ctx *c, const struct air_block *from, const struct air_block *to)
-{
-   if (c->dead_block && c->dead_block[from->index])
-      return true;
-   return c->dead_edges && _mesa_set_search(c->dead_edges, edge_key(from, to));
-}
-
-static void
-kill_edge(struct air_ctx *c, const struct air_block *from, const struct air_block *to)
-{
-   if (!c->dead_edges)
-      c->dead_edges = _mesa_pointer_set_create(c->mem_ctx);
-   _mesa_set_add(c->dead_edges, edge_key(from, to));
-}
-
 static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
 {
    struct air_val *first = NULL;
    for (unsigned k = 0; k < in->num_operands; k++) {
-      if (!in->targets[k] || !reachable[in->targets[k]->index] ||
-          edge_dead(c, in->targets[k], in->parent))
+      if (!in->targets[k] || !reachable[in->targets[k]->index])
          continue;
       struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
       if (!e)
@@ -4008,47 +3431,9 @@ translate_body(struct air_ctx *c)
    for (unsigned oi = 0; oi < num_order; oi++)
       reachable[order[oi]] = true;
 
-   /* each block's predecessors, for which of them can still reach it */
-   unsigned *npred = rzalloc_array(c->mem_ctx, unsigned, MAX2(f->num_blocks, 1));
-   const struct air_block ***preds =
-      rzalloc_array(c->mem_ctx, const struct air_block **, MAX2(f->num_blocks, 1));
-   for (unsigned bi = 0; bi < f->num_blocks; bi++) {
-      const struct air_block *blk = &f->blocks[bi];
-      if (!blk->num_insts)
-         continue;
-      const struct air_inst *term = blk->insts[blk->num_insts - 1];
-      if (term->op != AIR_OP_BR && term->op != AIR_OP_SWITCH)
-         continue;
-      for (unsigned t = 0; t < term->num_targets; t++) {
-         unsigned to = term->targets[t]->index;
-         preds[to] = reralloc(c->mem_ctx, preds[to], const struct air_block *, npred[to] + 1);
-         preds[to][npred[to]++] = blk;
-      }
-   }
-   bool *translated = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_blocks, 1));
-   c->dead_block = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_blocks, 1));
-   c->dead_edges = NULL;
-
    for (unsigned oi = 0; oi < num_order; oi++) {
       unsigned bi = order[oi];
       const struct air_block *blk = &f->blocks[bi];
-      /* Dead when every edge in from before it is dead. A predecessor not
-       * translated yet comes in over a back edge, from inside a loop this block
-       * heads, which nothing can enter if every way in from before is dead --
-       * so it does not keep the block alive (the CFGs here are reducible). */
-      if (bi != 0) {
-         bool dead = npred[bi] > 0;
-         for (unsigned p = 0; p < npred[bi] && dead; p++)
-            if (translated[preds[bi][p]->index] &&
-                !edge_dead(c, preds[bi][p], blk))
-               dead = false;
-         if (dead && !_mesa_hash_table_search(c->blocks, blk)) {
-            c->dead_block[bi] = true;
-            translated[bi] = true;
-            continue;
-         }
-      }
-      translated[bi] = true;
       nir_block *nb = nir_block_of(c, blk);
       c->b.cursor = nir_after_block(nb);
 
@@ -4112,18 +3497,11 @@ translate_body(struct air_ctx *c)
             nir_def *cond = air_get_ssa(c, term->operands[0]);
             if (!cond)
                return false;
-            bool taken;
-            if (term->targets[0] == term->targets[1]) {
+            if (term->targets[0] == term->targets[1])
                nir_goto(&c->b, nir_block_of(c, term->targets[0]));
-            } else if (air_const_bool(cond, &taken)) {
-               /* a branch decided while translating: one edge, and the other
-                * dead (edge_dead) */
-               kill_edge(c, blk, term->targets[taken ? 1 : 0]);
-               nir_goto(&c->b, nir_block_of(c, term->targets[taken ? 0 : 1]));
-            } else {
+            else
                nir_goto_if(&c->b, nir_block_of(c, term->targets[0]), cond,
                            nir_block_of(c, term->targets[1]));
-            }
          }
          break;
       case AIR_OP_SWITCH: {
@@ -4143,29 +3521,6 @@ translate_body(struct air_ctx *c)
          nir_def *cond = air_get_ssa(c, term->operands[0]);
          if (!cond)
             return false;
-         /* a switch decided while translating: its one target, the rest dead */
-         nir_const_value known[NIR_MAX_VEC_COMPONENTS];
-         if (cond->num_components == 1 && air_const_eval(cond, known, 0)) {
-            uint64_t v = nir_const_value_as_uint(known[0], cond->bit_size);
-            unsigned pick = 0;
-            for (unsigned k = 1; k < term->num_targets && !pick; k++) {
-               nir_def *cv = air_get_ssa(c, term->operands[k]);
-               nir_const_value cvv[NIR_MAX_VEC_COMPONENTS];
-               if (!cv || !air_const_eval(cv, cvv, 0)) {
-                  pick = ~0u;
-                  break;
-               }
-               if (nir_const_value_as_uint(cvv[0], cv->bit_size) == v)
-                  pick = k;
-            }
-            if (pick != ~0u) {
-               for (unsigned k = 0; k < term->num_targets; k++)
-                  if (term->targets[k] != term->targets[pick])
-                     kill_edge(c, blk, term->targets[k]);
-               nir_goto(&c->b, nir_block_of(c, term->targets[pick]));
-               break;
-            }
-         }
          nir_block *deflt = nir_block_of(c, term->targets[0]);
          unsigned n = term->num_targets - 1;
          for (unsigned k = 0; k < n; k++) {
@@ -4217,8 +3572,6 @@ translate_body(struct air_ctx *c)
             struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
             if (!ce)
                continue; /* an edge from a block the entry cannot reach */
-            if (edge_dead(c, in->targets[k], in->parent))
-               continue; /* or one no branch can take */
             c->b.cursor = *(nir_cursor *)ce->data;
             nir_def *val = air_get_ssa(c, in->operands[k]);
             if (!val)
@@ -4235,8 +3588,8 @@ translate_body(struct air_ctx *c)
 /* -- module-scope variables --------------------------------------------- */
 
 /* the index !air.function_constants gives this global, or -1 */
-int
-air_function_constant_index(struct air_ctx *c, const struct air_global *g)
+static int
+function_constant_index(struct air_ctx *c, const struct air_global *g)
 {
    const struct air_named_md *n = named_md(c->m, "air.function_constants");
    for (unsigned i = 0; i < (n ? n->num_ops : 0); i++) {
@@ -4308,7 +3661,7 @@ plan_globals(struct air_ctx *c)
       }
 
       if (g->externally_initialized) {
-         int idx = air_function_constant_index(c, g);
+         int idx = function_constant_index(c, g);
          if (idx < 0) {
             air_error(c, "interface: an externally initialized variable that is not a "
                          "function constant");
@@ -4357,23 +3710,6 @@ plan_globals(struct air_ctx *c)
          pl->offset = c->shared_size;
          pl->has_offset = true;
          c->shared_size += air_type_alloc_size(c->m, g->value_type);
-      } else if (c->known.evaluated && c->known.bytes[i] && !c->known.written[i]) {
-         /* A program-scope variable nothing but the static initializers
-          * writes, and they have been run (air_partial.c): its value is known,
-          * so it is constant data. A load at a constant offset is then a
-          * constant while translating (air_load_ptr), and NIR folds any other.
-          */
-         unsigned align = MAX2(g->align, air_type_abi_align(c->m, g->value_type));
-         unsigned at = ALIGN_POT(c->constant_data_size, MAX2(align, 1));
-         c->constant_data = reralloc_size(c->mem_ctx, c->constant_data,
-                                          at + c->known.size[i]);
-         memset(c->constant_data + c->constant_data_size, 0, at - c->constant_data_size);
-         memcpy(c->constant_data + at, c->known.bytes[i], c->known.size[i]);
-         c->constant_data_size = at + (unsigned)c->known.size[i];
-         pl->class = AIR_PTR_CONSTANT_DATA;
-         pl->offset = at;
-         pl->has_offset = true;
-         pl->known = true;
       } else {
          /* a program-scope variable: private to the invocation, written by
           * the static initializers below
@@ -4385,13 +3721,6 @@ plan_globals(struct air_ctx *c)
          pl->has_offset = true;
          c->scratch_size += air_type_alloc_size(c->m, g->value_type);
       }
-   }
-   /* the constant data, now that it is all laid out: a load_constant's range is
-    * the whole of it, and it is read while translating */
-   if (c->constant_data_size) {
-      c->nir->constant_data = ralloc_size(c->nir, c->constant_data_size);
-      memcpy(c->nir->constant_data, c->constant_data, c->constant_data_size);
-      c->nir->constant_data_size = c->constant_data_size;
    }
 }
 
@@ -4426,39 +3755,6 @@ materialise_globals(struct air_ctx *c)
 static void
 run_static_initializers(struct air_ctx *c)
 {
-   /* Run while translating (air_partial.c): a variable nothing else writes is
-    * constant data already, and one the body writes too gets the value they
-    * left, here, in place of the code that computed it -- its bytes, and the
-    * pointers it holds as remembered pointers (c->ptr_slots).
-    */
-   if (c->known.evaluated) {
-      for (unsigned i = 0; i < c->m->num_globals; i++) {
-         const struct air_global_plan *pl = &c->global_plan[i];
-         if (pl->skip || pl->known || pl->class != AIR_PTR_SCRATCH || !c->known.bytes[i])
-            continue;
-         const uint8_t *bytes = c->known.bytes[i];
-         uint64_t size = c->known.size[i];
-         for (uint64_t at = 0; at < size;) {
-            unsigned chunk = at + 4 <= size && (pl->offset + at) % 4 == 0 ? 4 : 1;
-            uint32_t v = 0;
-            memcpy(&v, bytes + at, chunk);
-            nir_store_scratch(&c->b, nir_imm_intN_t(&c->b, v, chunk * 8),
-                              nir_imm_int(&c->b, pl->offset + (unsigned)at),
-                              .align_mul = chunk, .write_mask = 1);
-            at += chunk;
-         }
-      }
-      for (unsigned p = 0; p < c->known.num_ptrs; p++) {
-         const struct air_known_ptr *kp = &c->known.ptrs[p];
-         const struct air_global_plan *pl = &c->global_plan[kp->global];
-         if (pl->skip || pl->known || pl->class != AIR_PTR_SCRATCH)
-            continue;
-         struct air_val *target = air_get(c, &c->m->globals[kp->target]->base);
-         if (target)
-            air_remember_pointer(c, pl->offset + (unsigned)kp->offset, target);
-      }
-      return;
-   }
    for (unsigned i = 0; i < c->m->num_functions; i++) {
       const struct air_function *f = c->m->functions[i];
       if (f->is_declaration || !f->section || strcmp(f->section, "air.static_init"))
@@ -4646,10 +3942,6 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
          air_error(&c, "interface: parameter %u has no metadata", i);
    }
 
-   /* the static initializers, run here with the pipeline's function constants
-    * when everything in them is something air_partial.c evaluates */
-   if (!c.error[0])
-      air_eval_static_initializers(&c);
    if (!c.error[0])
       plan_globals(&c);
    if (!c.error[0])
@@ -4724,10 +4016,6 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     * point, which every consumer of this NIR assumes.
     */
    if (_mesa_hash_table_num_entries(c.fns)) {
-      /* a return in the middle of a callee: nir_lower_goto_ifs leaves a jump to a
-       * function's end as a `return` where it cannot fold it into the structure, and
-       * the inliner takes none (RenderBox's gradient shaders) */
-      NIR_PASS(_, c.nir, nir_lower_returns);
       NIR_PASS(_, c.nir, nir_inline_functions);
       NIR_PASS(_, c.nir, nir_opt_deref);
       nir_remove_non_entrypoints(c.nir);

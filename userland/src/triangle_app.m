@@ -98,9 +98,7 @@
 #import <objc/runtime.h>
 
 #include <dispatch/dispatch.h>
-#include <dlfcn.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -199,78 +197,6 @@ rwt_say(const char *format, ...)
 	}
 	line[n++] = '\n';
 	(void)write(rwt_console >= 0 ? rwt_console : 2, line, (size_t)n);
-}
-
-/*
- * Where this process died, if it does: no crash report reaches this port's log, and the
- * driver and its compiler library are not in the shared cache, so an address is given as
- * the image it is in and the offset into it (and the nearest exported symbol), which the
- * build's own unstripped copy turns into a line. Then the signal kills the process as
- * before. dladdr is not async-signal-safe; a process this far gone has nothing to lose.
- */
-static void
-rwt_where(char *out, size_t size, uintptr_t address)
-{
-	Dl_info info;
-
-	if (address != 0 && dladdr((void *)address, &info) != 0 && info.dli_fname != NULL) {
-		const char *base = strrchr(info.dli_fname, '/');
-
-		snprintf(out, size, "%s+%#lx (%s+%#lx)", base != NULL ? base + 1 : info.dli_fname,
-		    (unsigned long)(address - (uintptr_t)info.dli_fbase),
-		    info.dli_sname != NULL ? info.dli_sname : "?",
-		    (unsigned long)(address - (uintptr_t)info.dli_saddr));
-	} else {
-		snprintf(out, size, "%#lx", (unsigned long)address);
-	}
-}
-
-static void
-rwt_fault(int signal_number, siginfo_t *info, void *context_in)
-{
-	ucontext_t *context = context_in;
-	uintptr_t pc = 0, lr = 0, fp = 0;
-	char where[512];
-
-	if (context != NULL && context->uc_mcontext != NULL) {
-		pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
-		lr = (uintptr_t)context->uc_mcontext->__ss.__lr;
-		fp = (uintptr_t)context->uc_mcontext->__ss.__fp;
-	}
-	rwt_say("triangle: FAULT: signal %d, address %p", signal_number,
-	    info != NULL ? info->si_addr : NULL);
-	rwt_where(where, sizeof(where), pc);
-	rwt_say("triangle: FAULT: pc %s", where);
-	rwt_where(where, sizeof(where), lr);
-	rwt_say("triangle: FAULT: lr %s", where);
-	/* the callers, by the frame pointers: [fp] is the frame above, [fp + 8] its return */
-	for (unsigned i = 0; i < 12 && fp != 0 && (fp & 7) == 0; i++) {
-		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
-
-		if (ret == 0) {
-			break;
-		}
-		rwt_where(where, sizeof(where), ret);
-		rwt_say("triangle: FAULT: called from %s", where);
-		fp = next > fp ? next : 0;
-	}
-	signal(signal_number, SIG_DFL);
-	raise(signal_number);
-}
-
-static void
-rwt_watch_for_faults(void)
-{
-	struct sigaction action;
-
-	memset(&action, 0, sizeof(action));
-	action.sa_sigaction = rwt_fault;
-	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
-	sigaction(SIGSEGV, &action, NULL);
-	sigaction(SIGBUS, &action, NULL);
-	sigaction(SIGABRT, &action, NULL);
-	sigaction(SIGILL, &action, NULL);
-	sigaction(SIGTRAP, &action, NULL);
 }
 
 /*
@@ -1330,7 +1256,6 @@ main(int argc, char *argv[])
 	int layer_mode = argc > 1 && strcmp(argv[1], "--layer") == 0;
 
 	rwt_open_console();
-	rwt_watch_for_faults();
 	rwt_say("triangle: start: RedwoodTriangle, pid %d, uid %d, mode %s", (int)getpid(),
 	    (int)getuid(), layer_mode ? "--layer (no UIKit, no window)" : "application");
 	if (layer_mode) {

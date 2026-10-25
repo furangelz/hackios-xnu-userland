@@ -16,7 +16,6 @@ files_libair = files(
   'air_private.h',
   'air_to_nir.c',
   'air_intrinsics.c',
-  'air_partial.c',
   'nir_air.h',
 )
 

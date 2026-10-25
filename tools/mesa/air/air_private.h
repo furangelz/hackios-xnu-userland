@@ -43,7 +43,6 @@ struct air_ptr {
    enum air_ptr_class class;
    unsigned binding;
    bool is_image;                    /* a texture the shader writes: an image, not a view */
-   bool is_null;                     /* TEXTURE: Metal's null texture (null_texture_op) */
    nir_def *offset;                  /* bytes, 32-bit; NULL means zero */
    const struct air_type *pointee;   /* for sizes, and for loads without a type */
 };
@@ -113,28 +112,6 @@ struct air_argbuf {
    const char *name, *type_name;
    unsigned num_members;
    struct air_argbuf_member *members;
-};
-
-/* What the static initializers leave in the program-scope variables, evaluated
- * while translating (air_partial.c). Per global, by its index in m->globals:
- * its bytes, or NULL for one that is not modelled, and whether anything but
- * the initializers may write it. A pointer a variable holds is a cell beside
- * the bytes: (variable, byte offset) -> the global it points at.
- */
-struct air_known_ptr {
-   unsigned global;
-   uint64_t offset;
-   unsigned target;
-};
-
-struct air_known {
-   bool evaluated;          /* every initializer ran here */
-   bool had_initializers;
-   uint8_t **bytes;
-   uint64_t *size;
-   bool *written;
-   struct air_known_ptr *ptrs;
-   unsigned num_ptrs;
 };
 
 struct air_ctx {
@@ -210,31 +187,7 @@ struct air_ctx {
       unsigned offset;      /* bytes, when has_offset */
       bool has_offset;
       bool skip;            /* llvm.* lists, and anything that failed */
-      bool known;           /* its value is c->known's, in the constant data */
    } *global_plan;
-
-   /* the static initializers, evaluated (air_partial.c) */
-   struct air_known known;
-
-   /* The shader's constant data as it is laid out: the known variables'
-    * bytes, assigned to the nir_shader once every variable is planned. */
-   uint8_t *constant_data;
-   unsigned constant_data_size;
-
-   /* POINTERS STORED IN LOCALS, while translating: a pointer is a resolution
-    * here and has no bytes, so a store of one into scratch memory at a
-    * constant offset is remembered instead (air_val *, keyed by offset + 1)
-    * and a load of a pointer from there answers it. The impl it was made in
-    * is kept beside it: a chosen pointer carries a def of that impl. */
-   struct hash_table *ptr_slots;
-   nir_function_impl *ptr_slots_impl;
-
-   /* Edges and blocks of the function being translated that a branch on a
-    * condition known while translating can never take (translate_body). */
-   struct set *dead_edges;
-   bool *dead_block;
-
-
 
    /* what the entry point's parameters are */
    unsigned num_params;
@@ -263,17 +216,6 @@ struct air_ctx {
 };
 
 bool air_error(struct air_ctx *c, const char *fmt, ...) PRINTFLIKE(2, 3);
-
-/* the index !air.function_constants gives this global, or -1 */
-int air_function_constant_index(struct air_ctx *c, const struct air_global *g);
-
-/* air_partial.c: run the static initializers over the variables' bytes with
- * the pipeline's function constants; false (and c->known cleared) when they
- * hold something the evaluator does not know, and then they are translated */
-bool air_eval_static_initializers(struct air_ctx *c);
-
-/* a pointer stored at a constant scratch offset, remembered (air_ctx.ptr_slots) */
-void air_remember_pointer(struct air_ctx *c, unsigned offset, struct air_val *val);
 
 /* value bookkeeping */
 struct air_val *air_val_ssa(struct air_ctx *c, nir_def *def);

@@ -24,7 +24,6 @@
  * reason in an NSError that an application will show a person.
  */
 
-#include <pthread.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -60,9 +59,6 @@
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
-#include "util/u_gen_mipmap.h"
-#include "util/u_transfer.h"
-#include "util/box.h"
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
@@ -78,9 +74,6 @@
  * seventeenth.
  */
 #define RWA_MAX_TEXTURES 16
-
-/* The words of a shader buffer's offset the shader adds itself (ssbo_any_offset). */
-#define RWA_SSBO_OFFSET_WORDS 32
 
 struct rwa_device {
    struct pipe_screen *screen;
@@ -118,67 +111,12 @@ struct rwa_device {
     */
    unsigned ubo_offset_align, ssbo_offset_align;
 
-   /* The words ssbo_any_offset's shaders add to their shader buffers' offsets, one set
-    * per stage, handed to the driver as a user buffer at each draw. They live here and
-    * not on bind_stage's stack because softpipe does not copy a user buffer: it wraps
-    * the pointer and reads it when the draw runs, after bind_stage has returned
-    * (freedreno uploads it at once). Each draw of softpipe's is finished before
-    * draw_vbo returns, so the next draw's words cannot reach a draw still running.
-    */
-   uint32_t ssbo_rest[PIPE_SHADER_TYPES][RWA_SSBO_OFFSET_WORDS];
-
    /* Every buffer that holds an argument-buffer encoding, so that destroying a texture,
     * a sampler or a buffer can scrub it out of the records that name it. Short by
     * construction: a buffer joins only when something is encoded into it.
     */
    struct rwa_buffer *encoded;
-
-   /* One lock over the context, recursive, taken by every call that reaches it. Metal
-    * encodes, commits, uploads textures and releases objects from whatever threads the
-    * application has (the window server alone uses three), and a Gallium context is not
-    * thread-safe. A driver holds it across a whole command buffer with rwa_device_lock,
-    * so a pass and its draws are never interleaved with another thread's.
-    */
-   pthread_mutex_t lock;
-
-   /* The render pass rwa_pass_begin set up, until rwa_pass_end: its attachments, its
-    * surfaces and how far its draws' bindings reached (struct rwa_pass_state, below).
-    */
-   struct rwa_pass_state *pass;
 };
-
-static inline struct rwa_device *
-rwa_hold(struct rwa_device *device)
-{
-   if (device)
-      pthread_mutex_lock(&device->lock);
-   return device;
-}
-
-static inline void
-rwa_release_held(struct rwa_device **device)
-{
-   if (*device)
-      pthread_mutex_unlock(&(*device)->lock);
-}
-
-/* The lock for the rest of the enclosing block, released on every way out of it. */
-#define RWA_HOLD(device) \
-   struct rwa_device *rwa_held_ __attribute__((cleanup(rwa_release_held), unused)) = \
-      rwa_hold(device)
-
-void
-rwa_device_lock(struct rwa_device *device)
-{
-   rwa_hold(device);
-}
-
-void
-rwa_device_unlock(struct rwa_device *device)
-{
-   if (device)
-      pthread_mutex_unlock(&device->lock);
-}
 
 /*
  * WHAT AN MTLArgumentEncoder LEAVES BEHIND, which is a record and not bytes.
@@ -483,13 +421,6 @@ struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
 {
    struct rwa_device *device = calloc(1, sizeof(*device));
-   if (device) {
-      pthread_mutexattr_t attr;
-      pthread_mutexattr_init(&attr);
-      pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-      pthread_mutex_init(&device->lock, &attr);
-      pthread_mutexattr_destroy(&attr);
-   }
    if (!device) {
       say(why, why_size, "out of memory making a device");
       return NULL;
@@ -663,7 +594,6 @@ rwa_device_name(struct rwa_device *device)
 struct rwa_buffer *
 rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_size)
 {
-   RWA_HOLD(device);
    if (size == 0 || size > UINT32_MAX) {
       say(why, why_size, "a buffer of %zu bytes: Gallium sizes a buffer in 32 bits and "
                          "zero is not a buffer", size);
@@ -726,8 +656,6 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
       free(buffer);
       return NULL;
    }
-   /* zeroed, as a new Metal buffer reads (see rwa_texture_create) */
-   memset(buffer->map, 0, size);
    return buffer;
 }
 
@@ -748,7 +676,6 @@ rwa_buffer_destroy(struct rwa_buffer *buffer)
 {
    if (!buffer)
       return;
-   RWA_HOLD(buffer ? buffer->device : NULL);
    /* Out of every argument-buffer record that named it, and then its own records go:
     * see argbuf_scrub -- a pointer left in a record is memory this library would
     * dereference at the next draw, where Metal's own stale handle would at worst be
@@ -916,40 +843,6 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    { 124, "MTLPixelFormatRGBA32Sint",      PIPE_FORMAT_R32G32B32A32_SINT },
    { 125, "MTLPixelFormatRGBA32Float",     PIPE_FORMAT_R32G32B32A32_FLOAT },
 
-   /* ASTC, which the Adreno 660 samples itself: CoreAnimation keeps compressed images in it
-    * (com.apple.coreanimation.compressed-image, a full-screen 4x4 one over a mapped file).
-    * Sixteen bytes a block whatever its size; a region is in texels and a row of memory is
-    * a row of blocks (caller_stride). The HDR variants, 222-236, are not here.
-    */
-   { 186, "MTLPixelFormatASTC_4x4_sRGB",   PIPE_FORMAT_ASTC_4x4_SRGB },
-   { 187, "MTLPixelFormatASTC_5x4_sRGB",   PIPE_FORMAT_ASTC_5x4_SRGB },
-   { 188, "MTLPixelFormatASTC_5x5_sRGB",   PIPE_FORMAT_ASTC_5x5_SRGB },
-   { 189, "MTLPixelFormatASTC_6x5_sRGB",   PIPE_FORMAT_ASTC_6x5_SRGB },
-   { 190, "MTLPixelFormatASTC_6x6_sRGB",   PIPE_FORMAT_ASTC_6x6_SRGB },
-   { 192, "MTLPixelFormatASTC_8x5_sRGB",   PIPE_FORMAT_ASTC_8x5_SRGB },
-   { 193, "MTLPixelFormatASTC_8x6_sRGB",   PIPE_FORMAT_ASTC_8x6_SRGB },
-   { 194, "MTLPixelFormatASTC_8x8_sRGB",   PIPE_FORMAT_ASTC_8x8_SRGB },
-   { 195, "MTLPixelFormatASTC_10x5_sRGB",  PIPE_FORMAT_ASTC_10x5_SRGB },
-   { 196, "MTLPixelFormatASTC_10x6_sRGB",  PIPE_FORMAT_ASTC_10x6_SRGB },
-   { 197, "MTLPixelFormatASTC_10x8_sRGB",  PIPE_FORMAT_ASTC_10x8_SRGB },
-   { 198, "MTLPixelFormatASTC_10x10_sRGB", PIPE_FORMAT_ASTC_10x10_SRGB },
-   { 199, "MTLPixelFormatASTC_12x10_sRGB", PIPE_FORMAT_ASTC_12x10_SRGB },
-   { 200, "MTLPixelFormatASTC_12x12_sRGB", PIPE_FORMAT_ASTC_12x12_SRGB },
-   { 204, "MTLPixelFormatASTC_4x4_LDR",    PIPE_FORMAT_ASTC_4x4 },
-   { 205, "MTLPixelFormatASTC_5x4_LDR",    PIPE_FORMAT_ASTC_5x4 },
-   { 206, "MTLPixelFormatASTC_5x5_LDR",    PIPE_FORMAT_ASTC_5x5 },
-   { 207, "MTLPixelFormatASTC_6x5_LDR",    PIPE_FORMAT_ASTC_6x5 },
-   { 208, "MTLPixelFormatASTC_6x6_LDR",    PIPE_FORMAT_ASTC_6x6 },
-   { 210, "MTLPixelFormatASTC_8x5_LDR",    PIPE_FORMAT_ASTC_8x5 },
-   { 211, "MTLPixelFormatASTC_8x6_LDR",    PIPE_FORMAT_ASTC_8x6 },
-   { 212, "MTLPixelFormatASTC_8x8_LDR",    PIPE_FORMAT_ASTC_8x8 },
-   { 213, "MTLPixelFormatASTC_10x5_LDR",   PIPE_FORMAT_ASTC_10x5 },
-   { 214, "MTLPixelFormatASTC_10x6_LDR",   PIPE_FORMAT_ASTC_10x6 },
-   { 215, "MTLPixelFormatASTC_10x8_LDR",   PIPE_FORMAT_ASTC_10x8 },
-   { 216, "MTLPixelFormatASTC_10x10_LDR",  PIPE_FORMAT_ASTC_10x10 },
-   { 217, "MTLPixelFormatASTC_12x10_LDR",  PIPE_FORMAT_ASTC_12x10 },
-   { 218, "MTLPixelFormatASTC_12x12_LDR",  PIPE_FORMAT_ASTC_12x12 },
-
    /* Depth and stencil. These are in the same table because a depth texture is a
     * texture (air_metal.h) and every caller asks for one the same way; what the format
     * changes is which binding it can have and how its texels are read, and both of
@@ -1085,9 +978,9 @@ pixel_format_refusal(unsigned f)
    if (f >= 170 && f <= 183)
       return "one of the EAC or ETC2 compressed formats, whose texels come in blocks this "
              "library cannot make";
-   if (f >= 222 && f <= 236)
-      return "one of the ASTC HDR formats, which this library does not make (the LDR and "
-             "sRGB ones it does)";
+   if (f >= 186 && f <= 236)
+      return "one of the ASTC compressed formats, whose texels come in blocks this library "
+             "cannot make";
    if (f == 240 || f == 241)
       return "one of Metal's packed 4:2:2 video formats (GBGR422, BGRG422), where one block "
              "holds two texels and a region in texels is not a region in bytes";
@@ -1570,35 +1463,7 @@ struct rwa_texture *
 rwa_texture_create(struct rwa_device *device, const struct rwa_texture_shape *shape,
                    char *why, size_t why_size)
 {
-   RWA_HOLD(device);
-   struct rwa_texture *t = texture_of_shape(device, shape, NULL, why, why_size);
-   /*
-    * ZEROED, every level and layer. Neither Gallium nor Metal's documentation promises
-    * what a new texture holds, but freedreno hands out memory from its own cache of freed
-    * buffers -- an earlier frame's pixels -- while Apple's textures come from fresh, zeroed
-    * pages, and CoreAnimation draws as if it could rely on that: a texture it fills only
-    * partly reads as transparent black on an Apple GPU. One GPU clear per texture, at
-    * creation; an imported surface (rwa_texture_from_surface) keeps its contents. A
-    * multisample texture is left out: freedreno clears one only by mapping it, which it
-    * cannot, and such a texture is an attachment its pass's load action decides. So is a
-    * compressed one: freedreno hands its clear to Gallium's software path, which packs the
-    * value with the format's packer, and ASTC has none -- backboardd called through that
-    * NULL three times in a boot. A compressed texture is uploaded whole before it is read.
-    */
-   if (t && device->pipe->clear_texture && t->res->nr_samples <= 1 &&
-       !util_format_is_compressed(t->res->format)) {
-      static const uint8_t zero[16] = { 0 };
-      struct pipe_resource *r = t->res;
-      for (unsigned level = 0; level <= r->last_level; level++) {
-         unsigned layers = r->target == PIPE_TEXTURE_3D ? u_minify(r->depth0, level)
-                                                        : r->array_size;
-         struct pipe_box box;
-         u_box_3d(0, 0, 0, u_minify(r->width0, level), u_minify(r->height0, level),
-                  MAX2(layers, 1), &box);
-         device->pipe->clear_texture(device->pipe, r, level, &box, zero);
-      }
-   }
-   return t;
+   return texture_of_shape(device, shape, NULL, why, why_size);
 }
 
 struct rwa_texture *
@@ -1606,7 +1471,6 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
                          int surface_id, unsigned offset, unsigned row_bytes, char *why,
                          size_t why_size)
 {
-   RWA_HOLD(device);
    /*
     * A surface ID of zero is not a surface. IOSurfaceGetID answers 0 for one that was
     * never made shareable, and the kernel's table has nothing at 0 either, so this would
@@ -1630,7 +1494,6 @@ rwa_texture_destroy(struct rwa_texture *texture)
 {
    if (!texture)
       return;
-   RWA_HOLD(texture ? texture->device : NULL);
    argbuf_scrub(texture->device, NULL, texture, NULL);
    /* The view first: it holds a reference of its own on the resource. Nothing has to
     * be unbound here, because rwa_dispatch unbinds every texture it bound once its
@@ -1639,7 +1502,7 @@ rwa_texture_destroy(struct rwa_texture *texture)
     * below is about.
     */
    if (texture->view)
-      pipe_sampler_view_reference(&texture->view, NULL);
+      texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
 }
@@ -1716,8 +1579,8 @@ static bool
 caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, size_t stride,
               size_t *out, char *why, size_t why_size)
 {
-   /* a row of blocks, for a compressed format: the same as a row of texels otherwise */
-   size_t least = util_format_get_stride(texture->res->format, box->width);
+   unsigned texel = util_format_get_blocksize(texture->res->format);
+   size_t least = (size_t)box->width * texel;
    if (stride == 0) {
       *out = least;
       return true;
@@ -1736,7 +1599,6 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                   const unsigned origin[3], const unsigned size[3], const void *bytes,
                   size_t stride, char *why, size_t why_size)
 {
-   RWA_HOLD(texture ? texture->device : NULL);
    struct pipe_box box;
    size_t row;
 
@@ -1799,8 +1661,7 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
     */
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
-                                          row * util_format_get_nblocksy(texture->res->format,
-                                                                         box.height));
+                                          row * box.height);
    return 0;
 }
 
@@ -1809,7 +1670,6 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                  const unsigned origin[3], const unsigned size[3], void *bytes,
                  size_t stride, char *why, size_t why_size)
 {
-   RWA_HOLD(texture ? texture->device : NULL);
    struct pipe_context *pipe = texture->device->pipe;
    struct pipe_box box;
    size_t row;
@@ -1865,13 +1725,11 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
     * that a single memcpy would pass every test here and then tear on the phone, where
     * freedreno's pitch is aligned and softpipe's is not.
     */
-   /* rows of blocks, for a compressed format */
-   size_t texel_row = util_format_get_stride(texture->res->format, box.width);
-   unsigned rows = util_format_get_nblocksy(texture->res->format, box.height);
+   size_t texel_row = (size_t)box.width * util_format_get_blocksize(texture->res->format);
    uint8_t *dst = bytes;
    for (int z = 0; z < box.depth; z++)
-      for (unsigned y = 0; y < rows; y++)
-         memcpy(dst + ((size_t)z * rows + y) * row,
+      for (int y = 0; y < box.height; y++)
+         memcpy(dst + ((size_t)z * box.height + y) * row,
                 map + (size_t)z * xfer->layer_stride + (size_t)y * xfer->stride, texel_row);
 
    pipe->texture_unmap(pipe, xfer);
@@ -1895,7 +1753,6 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                const unsigned origin[3], const unsigned size[3], float *depth,
                uint8_t *stencil, char *why, size_t why_size)
 {
-   RWA_HOLD(texture ? texture->device : NULL);
    struct pipe_context *pipe = texture->device->pipe;
    enum pipe_format format = texture->res->format;
    struct pipe_box box;
@@ -2281,7 +2138,6 @@ struct rwa_sampler *
 rwa_sampler_create(struct rwa_device *device, const struct rwa_sampler_state *state,
                    char *why, size_t why_size)
 {
-   RWA_HOLD(device);
    if (!state) {
       say(why, why_size, "a sampler with no state");
       return NULL;
@@ -2323,7 +2179,6 @@ rwa_sampler_destroy(struct rwa_sampler *sampler)
 {
    if (!sampler)
       return;
-   RWA_HOLD(sampler ? sampler->device : NULL);
    /* Nothing is unbound here: rwa_dispatch binds the samplers it needs and unbinds
     * them once its fence has come back, so nothing of this is in the context now. It
     * matters that it is not -- softpipe's delete_sampler_state is a plain FREE
@@ -2615,18 +2470,6 @@ buffer_offset_ok(const struct rwa_device *device, const struct air_resource *r,
           what, offset, b->size);
       return -1;
    }
-   /* A shader that adds the rest of the offset itself (ssbo_any_offset) takes any offset
-    * Metal allows: a multiple of four, which is the smallest thing it reads.
-    */
-   if (r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->any_offset &&
-       offset % device->ssbo_offset_align != 0) {
-      if (offset % 4 == 0)
-         return 0;
-      say(why, why_size, "%s is bound at offset %zu, and %s declares it in the `device` "
-                         "address space, where Metal asks for a multiple of four", what,
-          offset, name);
-      return -1;
-   }
    if (r->kind == AIR_RESOURCE_DEVICE_BUFFER &&
        offset % device->ssbo_offset_align != 0) {
       say(why, why_size, "%s is bound at offset %zu, and %s declares it in the `device` "
@@ -2638,215 +2481,6 @@ buffer_offset_ok(const struct rwa_device *device, const struct air_resource *r,
       return -1;
    }
    return 0;
-}
-
-/*
- * WHAT A SPECIALISED FUNCTION STILL READS. Metal requires only the arguments a function
- * uses to be bound -- reflection calls the rest inactive -- and CoreAnimation relies on
- * it: its compositing uber-shader declares fifteen textures, six constant buffers and
- * nine device buffers, one specialisation of it reads two constant buffers and one
- * texture, and the window server binds those and nothing else. Requiring the rest made
- * every such draw fail ("reads buffer 0 and 2 buffers were bound").
- *
- * So the folding a specialisation makes possible is done on a copy of the shader, and
- * every resource that no instruction of the copy names is marked unused: neither
- * required nor bound (check_bindings, bind_stage). The shader handed to the driver is
- * left as it was translated; its own compiler runs the same folding, so the dead
- * references go there too. A resource named at run time (an index that is not a
- * constant) leaves everything marked used.
- */
-static void
-mark_unused_resources(nir_shader *nir, struct air_shader_info *info)
-{
-   if (!info->num_resources)
-      return;
-   nir_shader *copy = nir_shader_clone(NULL, nir);
-   bool progress;
-   do {
-      progress = false;
-      NIR_PASS(progress, copy, nir_copy_prop);
-      NIR_PASS(progress, copy, nir_opt_constant_folding);
-      NIR_PASS(progress, copy, nir_opt_dead_cf);
-      NIR_PASS(progress, copy, nir_opt_dce);
-   } while (progress);
-
-   uint64_t ubo = 0, ssbo = 0, tex = 0, smp = 0, img = 0;
-   bool unknown = false;
-   nir_foreach_function_impl(impl, copy) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex) {
-               nir_tex_instr *t = nir_instr_as_tex(instr);
-               if (nir_tex_instr_src_index(t, nir_tex_src_texture_offset) >= 0 ||
-                   nir_tex_instr_src_index(t, nir_tex_src_sampler_offset) >= 0 ||
-                   nir_tex_instr_src_index(t, nir_tex_src_texture_deref) >= 0 ||
-                   nir_tex_instr_src_index(t, nir_tex_src_texture_handle) >= 0 ||
-                   t->texture_index >= 64 || t->sampler_index >= 64)
-                  unknown = true;
-               else {
-                  tex |= 1ull << t->texture_index;
-                  smp |= 1ull << t->sampler_index;
-               }
-               continue;
-            }
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-            uint64_t *mask = NULL;
-            unsigned src = 0;
-            switch (in->intrinsic) {
-            case nir_intrinsic_load_ubo:
-               mask = &ubo;
-               break;
-            case nir_intrinsic_load_ssbo:
-            case nir_intrinsic_ssbo_atomic:
-            case nir_intrinsic_ssbo_atomic_swap:
-            case nir_intrinsic_get_ssbo_size:
-               mask = &ssbo;
-               break;
-            case nir_intrinsic_store_ssbo:
-               mask = &ssbo;
-               src = 1;
-               break;
-            case nir_intrinsic_image_load:
-            case nir_intrinsic_image_store:
-            case nir_intrinsic_image_atomic:
-            case nir_intrinsic_image_atomic_swap:
-            case nir_intrinsic_image_size:
-            case nir_intrinsic_image_samples:
-               mask = &img;
-               break;
-            case nir_intrinsic_image_deref_load:
-            case nir_intrinsic_image_deref_store:
-            case nir_intrinsic_image_deref_atomic:
-            case nir_intrinsic_image_deref_atomic_swap:
-            case nir_intrinsic_image_deref_size:
-            case nir_intrinsic_bindless_image_load:
-            case nir_intrinsic_bindless_image_store:
-               unknown = true;
-               break;
-            default:
-               break;
-            }
-            if (!mask)
-               continue;
-            if (!nir_src_is_const(in->src[src]) || nir_src_as_uint(in->src[src]) >= 64)
-               unknown = true;
-            else
-               *mask |= 1ull << nir_src_as_uint(in->src[src]);
-         }
-      }
-   }
-   ralloc_free(copy);
-   if (unknown)
-      return;
-
-   for (unsigned i = 0; i < info->num_resources; i++) {
-      struct air_resource *r = &info->resources[i];
-      uint64_t bit = r->index < 64 ? 1ull << r->index : 0;
-      bool used;
-      if (r->argbuf_set != ~0u)
-         continue;   /* a member reaches its slot through the set's record */
-      switch (r->kind) {
-      case AIR_RESOURCE_CONSTANT_BUFFER: used = ubo & bit; break;
-      case AIR_RESOURCE_DEVICE_BUFFER:   used = ssbo & bit; break;
-      case AIR_RESOURCE_TEXTURE:         used = tex & bit; break;
-      case AIR_RESOURCE_IMAGE:           used = img & bit; break;
-      case AIR_RESOURCE_SAMPLER:         used = r->inline_sampler || (smp & bit); break;
-      default:                           used = true; break;
-      }
-      r->unused = !used;
-   }
-}
-
-/*
- * `DEVICE` BUFFERS AT ANY OFFSET METAL ALLOWS.
- *
- * Metal binds a buffer at any multiple of four and this GPU fetches a shader buffer from
- * multiples of 64 only (pipe_caps.shader_buffer_offset_alignment). RenderBox, which draws
- * the home screen's widgets, binds its vertex data at offsets like 120 and 6260, and
- * every one of those draws was refused. The copy that serves a `constant` buffer is no
- * answer for a `device` one, which the shader may write.
- *
- * So the shader adds the difference itself: every access to shader buffer n gets
- * offset + word n of a constant buffer this pass reserves, and bind_stage binds the buffer
- * at Metal's offset rounded down to 64 and puts the remainder in that word. The slot is the
- * highest of the screen's sixteen that the shader's own constant buffers leave free (Metal
- * puts those at their own [[buffer(n)]] indices, which start from 0); a shader that uses
- * all sixteen keeps the old rule. The words are uniform for the draw, so ir3 reads them out
- * of its constant file, and an access that was aligned to more than four bytes is told it
- * is aligned to four, which is all the remainder guarantees.
- *
- * Returns whether anything was rewritten; the slot is recorded in the info, and each
- * `device` buffer of the shader is marked as taking any offset. RWA_SSBO_OFFSET_WORDS, the
- * number of those words, is defined beside struct rwa_device, which keeps them.
- */
-
-static bool
-ssbo_any_offset(nir_shader *nir, struct air_shader_info *info)
-{
-   uint32_t used = 0;
-   bool any = false;
-   for (unsigned i = 0; i < info->num_resources; i++) {
-      const struct air_resource *r = &info->resources[i];
-      if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER && r->index < 32)
-         used |= 1u << r->index;
-      if (r->kind == AIR_RESOURCE_DEVICE_BUFFER)
-         any = true;
-   }
-   if (!any)
-      return false;
-   int slot = -1;
-   for (int s = 15; s >= 0 && slot < 0; s--)
-      if (!(used & (1u << s)))
-         slot = s;
-   if (slot < 0)
-      return false;
-
-   bool progress = false;
-   nir_foreach_function_impl(impl, nir) {
-      nir_builder b = nir_builder_create(impl);
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr_safe(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            unsigned buffer_src, offset_src;
-            switch (intr->intrinsic) {
-            case nir_intrinsic_load_ssbo:
-            case nir_intrinsic_ssbo_atomic:
-            case nir_intrinsic_ssbo_atomic_swap:
-               buffer_src = 0;
-               offset_src = 1;
-               break;
-            case nir_intrinsic_store_ssbo:
-               buffer_src = 1;
-               offset_src = 2;
-               break;
-            default:
-               continue;
-            }
-            b.cursor = nir_before_instr(instr);
-            nir_def *word = nir_imul_imm(&b, intr->src[buffer_src].ssa, 4);
-            nir_def *rest = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, slot), word,
-                                         .align_mul = 4, .align_offset = 0, .range_base = 0,
-                                         .range = RWA_SSBO_OFFSET_WORDS * 4);
-            nir_src_rewrite(&intr->src[offset_src],
-                            nir_iadd(&b, intr->src[offset_src].ssa, rest));
-            if (nir_intrinsic_has_align_mul(intr) && nir_intrinsic_align_mul(intr) > 4)
-               nir_intrinsic_set_align(intr, 4, 0);
-            progress = true;
-         }
-      }
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
-   }
-   if (!progress)
-      return false;
-   info->ssbo_offset_slot_plus1 = (unsigned)slot + 1;
-   for (unsigned i = 0; i < info->num_resources; i++)
-      if (info->resources[i].kind == AIR_RESOURCE_DEVICE_BUFFER)
-         info->resources[i].any_offset = true;
-   return true;
 }
 
 /*
@@ -3155,69 +2789,11 @@ slot_shapes(nir_shader *cs, struct rwa_slot slots[RWA_MAX_TEXTURES],
    }
 }
 
-/*
- * FUNCTION CONSTANTS: what a pipeline gives the translator. Unspecialised
- * (`given` NULL), every constant the module declares, as zero and defined --
- * what every caller written before specialisation existed passes. Specialised
- * (a specialised MTLFunction's values, possibly none), exactly the constants
- * the values name, as Metal has it: any other is undefined, and
- * air.is_function_constant_defined answers false for it -- which is how
- * CoreAnimation's compositing shader tells the images a pipeline has from the
- * ones it has not.
- */
-static unsigned
-pipeline_constants(void *mem_ctx, const void *bitcode, size_t size,
-                   const struct rwa_constant *given, unsigned num_given,
-                   struct air_constant_value **out)
-{
-   struct air_constant_value *declared;
-   unsigned n = air_module_function_constants(mem_ctx, bitcode, size, &declared);
-   *out = declared;
-   if (!given)
-      return n;
-   unsigned k = 0;
-   for (unsigned j = 0; j < n; j++) {
-      for (unsigned i = 0; i < num_given; i++) {
-         if (declared[j].index == given[i].index) {
-            declared[k] = declared[j];
-            declared[k].bits = given[i].bits;
-            k++;
-            break;
-         }
-      }
-   }
-   return k;
-}
-
-static struct rwa_compute *
-compute_create_common(struct rwa_device *device, const void *bitcode, size_t size,
-                      const char *entry, const struct rwa_constant *given, unsigned num_given,
-                      struct rwa_compute_info *info, char *why, size_t why_size);
-
 struct rwa_compute *
 rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_compute_info *info,
                    char *why, size_t why_size)
 {
-   return compute_create_common(device, bitcode, size, entry, NULL, 0, info, why, why_size);
-}
-
-struct rwa_compute *
-rwa_compute_create_with_constants(struct rwa_device *device, const void *bitcode, size_t size,
-                                  const char *entry, const struct rwa_constant *constants,
-                                  unsigned constant_count, struct rwa_compute_info *info,
-                                  char *why, size_t why_size)
-{
-   return compute_create_common(device, bitcode, size, entry, constants, constant_count, info,
-                                why, why_size);
-}
-
-static struct rwa_compute *
-compute_create_common(struct rwa_device *device, const void *bitcode, size_t size,
-                      const char *entry, const struct rwa_constant *given, unsigned num_given,
-                      struct rwa_compute_info *info, char *why, size_t why_size)
-{
-   RWA_HOLD(device);
    if (!bitcode || size < 4) {
       say(why, why_size, "%zu bytes is not a shader module", size);
       return NULL;
@@ -3239,7 +2815,7 @@ compute_create_common(struct rwa_device *device, const void *bitcode, size_t siz
     */
    struct air_constant_value *constants;
    unsigned num_constants =
-      pipeline_constants(compute->mem_ctx, bitcode, size, given, num_given, &constants);
+      air_module_function_constants(compute->mem_ctx, bitcode, size, &constants);
 
    /* library_wrapper is false, unlike air_run --library: a wrapped air.visible function
     * is a shader made up to be measurable, not a pipeline anyone can dispatch. Metal
@@ -3263,8 +2839,6 @@ compute_create_common(struct rwa_device *device, const void *bitcode, size_t siz
       say(why, why_size, "%s", error ? error : "the module could not be translated");
       goto fail;
    }
-   mark_unused_resources(compute->nir, &compute->info);
-   ssbo_any_offset(compute->nir, &compute->info);
 
    if (compute->info.stage != MESA_SHADER_COMPUTE) {
       /* Nothing reaches the first branch as of now: the translator refuses an
@@ -3397,7 +2971,6 @@ rwa_compute_destroy(struct rwa_compute *compute)
 {
    if (!compute)
       return;
-   RWA_HOLD(compute ? compute->device : NULL);
    if (compute->cso)
       delete_compute_state(compute->device, compute->cso);
    /* and the states built for the samplers the shader declared itself. Nothing is
@@ -3823,9 +3396,6 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
 
-      if (r->unused)
-         continue;   /* inactive in Metal's sense: see mark_unused_resources */
-
       /*
        * A MEMBER OF AN ARGUMENT BUFFER comes from the encoder's record and not from the
        * caller's arrays, and everything below this point is the same for both: the
@@ -3995,9 +3565,6 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
     */
    struct pipe_shader_buffer sb[PIPE_MAX_SHADER_BUFFERS] = { 0 };
    unsigned num_ssbo = 0, writable = 0;
-   /* what of each shader buffer's offset the shader adds itself (ssbo_any_offset) */
-   uint32_t *ssbo_rest = device->ssbo_rest[stage];
-   memset(ssbo_rest, 0, sizeof(device->ssbo_rest[stage]));
 
    /* and each texture as the kind of view its own instructions ask for. A read-only
     * texture stays a texture: Metal's read() on one becomes a txf, a texture fetch, so
@@ -4016,9 +3583,6 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       struct rwa_texture *t = NULL;
       struct rwa_sampler *sm = NULL;
       size_t boffset = 0;
-
-      if (r->unused)
-         continue;
 
       /* A member of an argument buffer comes from the encoder's record; everything
        * below binds it exactly as a direct argument, at the index the frontend gave it.
@@ -4065,18 +3629,10 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
          /* Metal's own `offset:`, for a member of a set and for a buffer argument
           * alike, and an offset this GPU cannot fetch from has already been refused by
           * name (buffer_offset_ok: a `device` buffer may be written, so the upload that
-          * serves a `constant` one would lose the writes) -- unless the shader adds the
-          * part it cannot fetch from itself (ssbo_any_offset): then the binding starts
-          * at the fetchable offset below Metal's and the rest goes in the shader's word.
-          * The SIZE is what is left of the buffer after the binding's start, so a shader
-          * reading past its own block reads past its binding rather than into the next
-          * one.
+          * serves a `constant` one would lose the writes). The SIZE is what is left of
+          * the buffer after the offset, so a shader reading past its own block reads
+          * past its binding rather than into the next one.
           */
-         if (r->any_offset && r->index < RWA_SSBO_OFFSET_WORDS) {
-            size_t rest = boffset % device->ssbo_offset_align;
-            ssbo_rest[r->index] = (uint32_t)rest;
-            boffset -= rest;
-         }
          sb[r->index].buffer_offset = (unsigned)boffset;
          sb[r->index].buffer_size = b->size - MIN2(b->size, boffset);
          num_ssbo = MAX2(num_ssbo, r->index + 1);
@@ -4242,16 +3798,6 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
 
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
-   /* The rest of each offset, for a shader that adds it, as a user buffer (the words are
-    * the device's: see struct rwa_device).
-    */
-   if (info->ssbo_offset_slot_plus1) {
-      struct pipe_constant_buffer cb = {
-         .user_buffer = ssbo_rest,
-         .buffer_size = sizeof(device->ssbo_rest[stage]),
-      };
-      pipe->set_constant_buffer(pipe, stage, info->ssbo_offset_slot_plus1 - 1, false, &cb);
-   }
    if (num_views)
       pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);
    if (num_images)
@@ -4306,7 +3852,6 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
                      const unsigned groups[3], const unsigned group_size[3],
                      char *why, size_t why_size)
 {
-   RWA_HOLD(compute ? compute->device : NULL);
    struct rwa_device *device = compute->device;
    struct pipe_context *pipe = device->pipe;
    const char *name = compute->info.entry_point ? compute->info.entry_point : "the shader";
@@ -4393,7 +3938,6 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
 int
 rwa_finish(struct rwa_device *device, char *why, size_t why_size)
 {
-   RWA_HOLD(device);
    return finish_or_say_why(device, false, "work", why, why_size);
 }
 
@@ -5069,7 +4613,6 @@ rwa_depth_stencil_create(struct rwa_device *device,
                          const struct rwa_depth_stencil_state *state, char *why,
                          size_t why_size)
 {
-   RWA_HOLD(device);
    if (!state) {
       say(why, why_size, "a depth/stencil state with no descriptor");
       return NULL;
@@ -5129,7 +4672,6 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
 {
    if (!state)
       return;
-   RWA_HOLD(state ? state->device : NULL);
    /* Unbound before deleted, unlike a sampler and like a pipeline's own states: a draw
     * binds this one and leaves it bound, so the context is holding exactly this pointer
     * when the caller lets it go. softpipe's delete is a plain FREE
@@ -5592,20 +5134,6 @@ struct rwa_render {
     * the draw binds the streams it names instead of the quad.
     */
    struct rwa_vertex_state vstate;
-
-   /* The rasterizer state `rast` was made from, and the variants of it an encoder's own
-    * state asks for: culling, winding, fill mode, the scissor test, depth clamping and
-    * depth bias are the render command encoder's in Metal and the rasterizer state's in
-    * Gallium (rast_for). Made when first asked for and kept with the pipeline.
-    */
-   struct pipe_rasterizer_state rast_templ;
-   struct rwa_rast_variant {
-      bool used;
-      unsigned cull, winding, fill, scissor, clamp;
-      float bias, slope, bias_clamp;
-      void *cso;
-   } rast_variant[8];
-   unsigned rast_next;
 };
 
 /* Clone, finalise and compile one stage, handing the driver a copy it may steal. The
@@ -5851,11 +5379,13 @@ blend_operation_name(unsigned op)
 static const char *
 blend_factor_refusal(unsigned f)
 {
-   /* The BLEND COLOUR factors (11-14) are served: their colour is encoder state
-    * (-setBlendColorRed:green:blue:alpha:), which reaches the context with each draw of a
-    * pass (rwa_draw_state.blend_color). A lone rwa_render_draw has no encoder and blends
-    * against the colour the context last had.
-    */
+   if (f >= 11 && f <= 14)
+      return "one of Metal's BLEND COLOUR factors, whose colour is ENCODER state "
+             "(-setBlendColorRed:green:blue:alpha:) and not pipeline state: this "
+             "contract has nowhere to carry it and the driver's own setter drops it, so "
+             "the blend would be against the zero a Gallium context starts with -- the "
+             "layer would vanish rather than fail. Serving it is one float[4] in "
+             "rwa_draw and one set_blend_color, on the day something asks";
    if (f >= 15 && f <= 18)
       /* Deliberately short: `why` is 512 bytes here and in the driver, and the prefix
        * naming the field takes some of it, so a longer sentence would arrive truncated
@@ -5890,10 +5420,10 @@ blend_factor_from_metal(unsigned f, bool alpha_channel, unsigned *out, const cha
       PIPE_BLENDFACTOR_DST_ALPHA,          /* ...DestinationAlpha                    8 */
       PIPE_BLENDFACTOR_INV_DST_ALPHA,      /* ...OneMinusDestinationAlpha            9 */
       PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE, /* ...SourceAlphaSaturated               10 */
-      PIPE_BLENDFACTOR_CONST_COLOR,        /* ...BlendColor            11  the draw state's colour */
-      PIPE_BLENDFACTOR_INV_CONST_COLOR,    /* ...OneMinusBlendColor    12 */
-      PIPE_BLENDFACTOR_CONST_ALPHA,        /* ...BlendAlpha            13 */
-      PIPE_BLENDFACTOR_INV_CONST_ALPHA,    /* ...OneMinusBlendAlpha    14 */
+      PIPE_BLENDFACTOR_CONST_COLOR,        /* ...BlendColor            11  REFUSED, above */
+      PIPE_BLENDFACTOR_INV_CONST_COLOR,    /* ...OneMinusBlendColor    12  REFUSED */
+      PIPE_BLENDFACTOR_CONST_ALPHA,        /* ...BlendAlpha            13  REFUSED */
+      PIPE_BLENDFACTOR_INV_CONST_ALPHA,    /* ...OneMinusBlendAlpha    14  REFUSED */
       PIPE_BLENDFACTOR_SRC1_COLOR,         /* ...Source1Color          15  REFUSED */
       PIPE_BLENDFACTOR_INV_SRC1_COLOR,     /* ...OneMinusSource1Color  16  REFUSED */
       PIPE_BLENDFACTOR_SRC1_ALPHA,         /* ...Source1Alpha          17  REFUSED */
@@ -6326,57 +5856,15 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen 
    return true;
 }
 
-static struct rwa_render *
-render_create_common(struct rwa_device *device,
-                     const void *vertex_bitcode, size_t vertex_size, const char *vertex_entry,
-                     const struct rwa_constant *vertex_constants, unsigned vertex_constant_count,
-                     const void *fragment_bitcode, size_t fragment_size,
-                     const char *fragment_entry,
-                     const struct rwa_constant *fragment_constants,
-                     unsigned fragment_constant_count,
-                     const struct rwa_render_shape *shape, struct rwa_render_info *info,
-                     char *why, size_t why_size);
-
 struct rwa_render *
-rwa_render_create(struct rwa_device *device, const void *vertex_bitcode, size_t vertex_size,
-                  const char *vertex_entry, const void *fragment_bitcode, size_t fragment_size,
-                  const char *fragment_entry, const struct rwa_render_shape *shape,
+rwa_render_create(struct rwa_device *device,
+                  const void *vertex_bitcode, size_t vertex_size,
+                  const char *vertex_entry,
+                  const void *fragment_bitcode, size_t fragment_size,
+                  const char *fragment_entry,
+                  const struct rwa_render_shape *shape,
                   struct rwa_render_info *info, char *why, size_t why_size)
 {
-   return render_create_common(device, vertex_bitcode, vertex_size, vertex_entry, NULL, 0,
-                               fragment_bitcode, fragment_size, fragment_entry, NULL, 0, shape,
-                               info, why, why_size);
-}
-
-struct rwa_render *
-rwa_render_create_with_constants(struct rwa_device *device, const void *vertex_bitcode,
-                                 size_t vertex_size, const char *vertex_entry,
-                                 const struct rwa_constant *vertex_constants,
-                                 unsigned vertex_constant_count, const void *fragment_bitcode,
-                                 size_t fragment_size, const char *fragment_entry,
-                                 const struct rwa_constant *fragment_constants,
-                                 unsigned fragment_constant_count,
-                                 const struct rwa_render_shape *shape,
-                                 struct rwa_render_info *info, char *why, size_t why_size)
-{
-   return render_create_common(device, vertex_bitcode, vertex_size, vertex_entry,
-                               vertex_constants, vertex_constant_count, fragment_bitcode,
-                               fragment_size, fragment_entry, fragment_constants,
-                               fragment_constant_count, shape, info, why, why_size);
-}
-
-static struct rwa_render *
-render_create_common(struct rwa_device *device,
-                     const void *vertex_bitcode, size_t vertex_size, const char *vertex_entry,
-                     const struct rwa_constant *vertex_constants, unsigned vertex_constant_count,
-                     const void *fragment_bitcode, size_t fragment_size,
-                     const char *fragment_entry,
-                     const struct rwa_constant *fragment_constants,
-                     unsigned fragment_constant_count,
-                     const struct rwa_render_shape *shape, struct rwa_render_info *info,
-                     char *why, size_t why_size)
-{
-   RWA_HOLD(device);
    if (!shape) {
       say(why, why_size, "a render pipeline with no attachment description");
       return NULL;
@@ -6536,8 +6024,8 @@ render_create_common(struct rwa_device *device,
     * links at draw time (ir3_cache_lookup), so the two belong to two different calls.
     */
    struct air_constant_value *ffc;
-   unsigned num_ffc = pipeline_constants(render->mem_ctx, fragment_bitcode, fragment_size,
-                                         fragment_constants, fragment_constant_count, &ffc);
+   unsigned num_ffc =
+      air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
    const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
    const char *error;
    nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
@@ -6556,8 +6044,6 @@ render_create_common(struct rwa_device *device,
              ? _mesa_shader_stage_to_string(render->finfo.stage) : "non-fragment");
       goto fail;
    }
-   mark_unused_resources(fs, &render->finfo);
-   ssbo_any_offset(fs, &render->finfo);
    slot_shapes(fs, render->frag_slots, render->frag_compare_sampler);
    count_resources(&render->finfo, render->frag_slots, &out.fragment_buffers,
                    &out.fragment_textures, &out.fragment_samplers);
@@ -6593,8 +6079,8 @@ render_create_common(struct rwa_device *device,
          goto fail;
       }
       struct air_constant_value *vfc;
-      unsigned num_vfc = pipeline_constants(render->mem_ctx, vertex_bitcode, vertex_size,
-                                            vertex_constants, vertex_constant_count, &vfc);
+      unsigned num_vfc =
+         air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
       const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
       vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
                       device->nir_options, &render->vinfo, &error);
@@ -6645,8 +6131,6 @@ render_create_common(struct rwa_device *device,
        * Metal ignores it: the module's interface decides what is fetched, and an
        * attribute nothing reads has no fetch to configure.
        */
-      mark_unused_resources(vs, &render->vinfo);
-      ssbo_any_offset(vs, &render->vinfo);
       slot_shapes(vs, render->vert_slots, render->vert_compare_sampler);
       unsigned vtex = 0, vsamp = 0;
       count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
@@ -6764,11 +6248,11 @@ render_create_common(struct rwa_device *device,
     * util_framebuffer_get_num_samples) and emits with emit_msaa. So this bit is the
     * honest state for a multisample pass and not the thing that turns multisampling on.
     */
-   render->rast_templ = (struct pipe_rasterizer_state){
-      .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
-      .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-      .multisample = samples > 1 };
-   render->rast = device->pipe->create_rasterizer_state(device->pipe, &render->rast_templ);
+   render->rast = device->pipe->create_rasterizer_state(device->pipe,
+      &(struct pipe_rasterizer_state){
+         .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+         .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+         .multisample = samples > 1 });
    if (!render->blend || !render->dsa || !render->rast) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
       goto fail;
@@ -6872,7 +6356,6 @@ rwa_render_destroy(struct rwa_render *render)
 {
    if (!render)
       return;
-   RWA_HOLD(render ? render->device : NULL);
    struct pipe_context *pipe = render->device->pipe;
 
    /* Unbound before deleted, each of them, for the reason delete_compute_state and
@@ -6900,9 +6383,6 @@ rwa_render_destroy(struct rwa_render *render)
       pipe->bind_rasterizer_state(pipe, NULL);
       pipe->delete_rasterizer_state(pipe, render->rast);
    }
-   for (unsigned i = 0; i < ARRAY_SIZE(render->rast_variant); i++)
-      if (render->rast_variant[i].used)
-         pipe->delete_rasterizer_state(pipe, render->rast_variant[i].cso);
    if (render->velem) {
       /* Unbound before deleted, and the vertex buffer unbound with it: the context holds
        * a reference of its own to whatever is bound there (set_vertex_buffers took it),
@@ -6959,79 +6439,9 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
    return true;
 }
 
-/*
- * The rasterizer state for an encoder's own state: Metal sets culling, winding, fill mode,
- * the scissor test, depth clamping and depth bias on the render command encoder, Gallium
- * in the rasterizer state object, so a pipeline keeps the variants it is drawn with. With
- * none of them set the pipeline's own state is the answer.
- *
- * WINDING. Metal's front face is the one whose vertices wind clockwise as the picture is
- * seen, row 0 at the top. This library's viewport puts clip y = +1 in row 0, and the
- * hardware decides winding in (column, row) coordinates with OpenGL's sense of
- * counter-clockwise, in which a triangle that looks clockwise with row 0 at the top is
- * counter-clockwise. So Metal's MTLWindingClockwise is Gallium's front_ccw.
- */
-static void *
-rast_for(struct rwa_render *render, const struct rwa_draw_state *st, char *why, size_t why_size)
-{
-   struct pipe_context *pipe = render->device->pipe;
-   unsigned cull = st->cull_mode, winding = st->front_winding, fill = st->fill_mode;
-   unsigned scissor = st->scissor_enabled ? 1 : 0, clamp = st->depth_clip_mode;
-
-   if (cull == 0 && fill == 0 && !scissor && clamp == 0 && st->depth_bias == 0.0f &&
-       st->depth_slope_scale == 0.0f)
-      return render->rast;
-   for (unsigned i = 0; i < ARRAY_SIZE(render->rast_variant); i++) {
-      struct rwa_rast_variant *v = &render->rast_variant[i];
-      if (v->used && v->cull == cull && v->winding == winding && v->fill == fill &&
-          v->scissor == scissor && v->clamp == clamp && v->bias == st->depth_bias &&
-          v->slope == st->depth_slope_scale && v->bias_clamp == st->depth_bias_clamp)
-         return v->cso;
-   }
-   if (cull > 2 || winding > 1 || fill > 1 || clamp > 1) {
-      say(why, why_size, "cull mode %u, winding %u, fill mode %u, depth clip mode %u: not "
-                         "values of Metal's enumerations", cull, winding, fill, clamp);
-      return NULL;
-   }
-   struct pipe_rasterizer_state rs = render->rast_templ;
-   rs.cull_face = cull == 1 ? PIPE_FACE_FRONT : cull == 2 ? PIPE_FACE_BACK : PIPE_FACE_NONE;
-   rs.front_ccw = winding == 0;
-   rs.fill_front = rs.fill_back = fill == 1 ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
-   rs.scissor = scissor;
-   rs.depth_clip_near = rs.depth_clip_far = clamp == 0;
-   rs.depth_clamp = clamp == 1;
-   if (st->depth_bias != 0.0f || st->depth_slope_scale != 0.0f) {
-      rs.offset_point = rs.offset_line = rs.offset_tri = 1;
-      rs.offset_units = st->depth_bias;
-      rs.offset_scale = st->depth_slope_scale;
-      rs.offset_clamp = st->depth_bias_clamp;
-   }
-   void *cso = pipe->create_rasterizer_state(pipe, &rs);
-   if (!cso) {
-      say(why, why_size, "%s would not make a rasterizer state for this encoder's state",
-          rwa_device_name(render->device));
-      return NULL;
-   }
-   struct rwa_rast_variant *v = &render->rast_variant[render->rast_next];
-   render->rast_next = (render->rast_next + 1) % ARRAY_SIZE(render->rast_variant);
-   /* the variant given up may be the one the last draw bound, and binding reads the
-    * state bound before it: the pipeline's own goes in first */
-   if (v->used) {
-      pipe->bind_rasterizer_state(pipe, render->rast);
-      pipe->delete_rasterizer_state(pipe, v->cso);
-   }
-   *v = (struct rwa_rast_variant){ .used = true, .cull = cull, .winding = winding,
-                                   .fill = fill, .scissor = scissor, .clamp = clamp,
-                                   .bias = st->depth_bias, .slope = st->depth_slope_scale,
-                                   .bias_clamp = st->depth_bias_clamp, .cso = cso };
-   return cso;
-}
-
-static int
-render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
-                   const struct rwa_draw_state *state, bool own_pass,
-                   struct rwa_bound *fbound_out, struct rwa_bound *vbound_out,
-                   char *why, size_t why_size)
+int
+rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+                char *why, size_t why_size)
 {
    struct rwa_device *device = render->device;
    struct pipe_context *pipe = device->pipe;
@@ -7327,10 +6737,6 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
     */
    struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS] = { 0 };
    struct pipe_surface *zsurf = NULL;
-   /* A draw inside a pass (rwa_pass_draw) finds the framebuffer already set and cleared by
-    * rwa_pass_begin; everything from here to set_framebuffer_state is a lone draw's own pass.
-    */
-   if (own_pass) {
    /* pipe_framebuffer_state.samples is filled in although nothing here reads it: both
     * drivers take the pass's sample count off the attachments instead
     * (util_framebuffer_get_num_samples ignores this field whenever there is one), and a
@@ -7347,7 +6753,7 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
          for (unsigned j = 0; j < i; j++)
-            pipe_surface_release(pipe, &surf[j]);
+            pipe->surface_destroy(pipe, surf[j]);
          return -1;
       }
       fb.cbufs[i] = surf[i];
@@ -7359,13 +6765,12 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
          for (unsigned j = 0; j < draw->color_count; j++)
-            pipe_surface_release(pipe, &surf[j]);
+            pipe->surface_destroy(pipe, surf[j]);
          return -1;
       }
       fb.zsbuf = zsurf;
    }
    pipe->set_framebuffer_state(pipe, &fb);
-   }
 
    /* The viewport, and now its z as well. Gallium's window depth is
     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
@@ -7376,19 +6781,6 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
     */
    float znear = draw->depth_range ? draw->depth_range[0] : 0.0f;
    float zfar = draw->depth_range ? draw->depth_range[1] : 1.0f;
-   /* -setViewport:'s rectangle, when the encoder set one: Metal's origin is the top left
-    * of the attachment and so is row 0 here, so the rectangle moves the centre and the
-    * scale is its own half size, still negative in y.
-    */
-   float vx = 0.0f, vy = 0.0f, vw = (float)w, vh = (float)h;
-   if (state && state->viewport[2] > 0.0f && state->viewport[3] > 0.0f) {
-      vx = state->viewport[0];
-      vy = state->viewport[1];
-      vw = state->viewport[2];
-      vh = state->viewport[3];
-      znear = state->viewport[4];
-      zfar = state->viewport[5];
-   }
    pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
@@ -7402,22 +6794,8 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
        * it is landed against -- it must turn from (100+x, 200+y, ...) into
        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
        */
-      .scale = { vw / 2.0f, -(vh / 2.0f), zfar - znear },
-      .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } });
-   /* and -setScissorRect:, in the same coordinates, clamped to the pass as Metal requires
-    * of it; the rasterizer state below switches the test on
-    */
-   if (state && state->scissor_enabled) {
-      unsigned x0 = MIN2(state->scissor[0], w), y0 = MIN2(state->scissor[1], h);
-      unsigned x1 = MIN2(state->scissor[0] + state->scissor[2], w);
-      unsigned y1 = MIN2(state->scissor[1] + state->scissor[3], h);
-      pipe->set_scissor_states(pipe, 0, 1, &(struct pipe_scissor_state){
-         .minx = x0, .miny = y0, .maxx = MAX2(x0, x1), .maxy = MAX2(y0, y1) });
-   }
-   if (state)
-      pipe->set_blend_color(pipe, &(struct pipe_blend_color){
-         .color = { state->blend_color[0], state->blend_color[1], state->blend_color[2],
-                    state->blend_color[3] } });
+      .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
+      .translate = { w / 2.0f, h / 2.0f, znear } });
 
    pipe->bind_blend_state(pipe, render->blend);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
@@ -7432,14 +6810,7 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
    pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
                      (uint8_t)(draw->stencil_reference[1] & 0xff) } });
-   if (state) {
-      void *rast = rast_for(render, state, why, why_size);
-      if (!rast)
-         return -1;
-      pipe->bind_rasterizer_state(pipe, rast);
-   } else {
-      pipe->bind_rasterizer_state(pipe, render->rast);
-   }
+   pipe->bind_rasterizer_state(pipe, render->rast);
    pipe->bind_vs_state(pipe, render->vs_cso);
    pipe->bind_fs_state(pipe, render->fs_cso);
 
@@ -7539,11 +6910,8 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
     * both would be a lie about one of them. Gallium takes all three in one call with a
     * mask, and a mask of nothing means no clear at all -- which is three load actions
     * of Load and the case where this does nothing.
-    *
-    * A draw inside a pass has no load actions of its own: rwa_pass_begin applied the
-    * pass's, once.
     */
-   if (own_pass) {
+   {
       union pipe_color_union clear;
       unsigned mask = 0;
       for (unsigned c = 0; c < 4; c++)
@@ -7598,23 +6966,6 @@ render_draw_common(struct rwa_render *render, const struct rwa_draw *draw,
       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
    }
 
-   /* A draw inside a pass is neither waited for nor unbound here: the pass's draws go to
-    * the GPU together when the command buffer is submitted (rwa_submit), and what each
-    * bound is taken back once, at rwa_pass_end. The caller learns how far the bindings
-    * reached so that it can.
-    */
-   if (!own_pass) {
-      fbound_out->num_ssbo = MAX2(fbound_out->num_ssbo, fbound.num_ssbo);
-      fbound_out->num_views = MAX2(fbound_out->num_views, fbound.num_views);
-      fbound_out->num_images = MAX2(fbound_out->num_images, fbound.num_images);
-      fbound_out->num_samplers = MAX2(fbound_out->num_samplers, fbound.num_samplers);
-      vbound_out->num_ssbo = MAX2(vbound_out->num_ssbo, vbound.num_ssbo);
-      vbound_out->num_views = MAX2(vbound_out->num_views, vbound.num_views);
-      vbound_out->num_images = MAX2(vbound_out->num_images, vbound.num_images);
-      vbound_out->num_samplers = MAX2(vbound_out->num_samplers, vbound.num_samplers);
-      return 0;
-   }
-
    /* Waited for here, on the same grounds as a dispatch: a picture that was never drawn
     * must not read as a result, and this is the call that can say which draw did not
     * come back (docs/air.md section 5). A link error between the stages, which ir3 only
@@ -7629,501 +6980,13 @@ unbind:
    /* The framebuffer is released before the surfaces are destroyed, and both before the
     * caller's next call, which may be rwa_texture_destroy on one of these attachments:
     * a context still holding a surface of a freed resource is the same trap as a bound
-    * sampler state (rwa_sampler_destroy). Inside a pass both belong to the pass.
+    * sampler state (rwa_sampler_destroy).
     */
-   if (own_pass) {
-      pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-      for (unsigned i = 0; i < draw->color_count; i++)
-         if (surf[i])
-            pipe_surface_release(pipe, &surf[i]);
-      if (zsurf)
-         pipe_surface_release(pipe, &zsurf);
-   }
+   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
+   for (unsigned i = 0; i < draw->color_count; i++)
+      if (surf[i])
+         pipe->surface_destroy(pipe, surf[i]);
+   if (zsurf)
+      pipe->surface_destroy(pipe, zsurf);
    return rc;
 }
-
-int
-rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
-                char *why, size_t why_size)
-{
-   RWA_HOLD(render->device);
-   return render_draw_common(render, draw, NULL, true, NULL, NULL, why, why_size);
-}
-
-/*
- * RENDER PASSES: one framebuffer, its load actions once, then any number of draws, and the
- * GPU given the whole command buffer at once (air_metal.h has the contract).
- */
-struct rwa_pass_state {
-   struct rwa_texture *color[PIPE_MAX_COLOR_BUFS];
-   unsigned color_count;
-   struct rwa_texture *depth;
-   struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS];
-   struct pipe_surface *zsurf;
-   struct rwa_bound fbound, vbound;
-   /* where a multisample colour attachment is resolved to when the pass ends
-    * (rwa_pass_resolve), NULL for none */
-   struct rwa_texture *resolve[PIPE_MAX_COLOR_BUFS];
-   unsigned resolve_level[PIPE_MAX_COLOR_BUFS], resolve_slice[PIPE_MAX_COLOR_BUFS];
-};
-
-static void
-pass_end_locked(struct rwa_device *device)
-{
-   struct rwa_pass_state *p = device->pass;
-   struct pipe_context *pipe = device->pipe;
-
-   if (!p)
-      return;
-   unbind_stage(device, PIPE_SHADER_FRAGMENT, &p->fbound);
-   unbind_stage(device, PIPE_SHADER_VERTEX, &p->vbound);
-   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-   /* The resolves, Metal's MTLStoreActionMultisampleResolve: each pixel's samples averaged
-    * into the one-sample texture, which is what Gallium's blit does when the source has
-    * samples and the destination has none. After the framebuffer is let go, and the
-    * driver orders a blit after the draws that wrote its source.
-    */
-   for (unsigned i = 0; i < p->color_count; i++) {
-      struct rwa_texture *src = p->color[i], *dst = p->resolve[i];
-      if (!src || !dst || !p->surf[i])
-         continue;
-      unsigned level = p->surf[i]->u.tex.level, slice = p->surf[i]->u.tex.first_layer;
-      int w = u_minify(src->res->width0, level), h = u_minify(src->res->height0, level);
-      struct pipe_blit_info b = { 0 };
-      b.src.resource = src->res;
-      b.src.format = src->res->format;
-      b.src.level = level;
-      u_box_3d(0, 0, slice, w, h, 1, &b.src.box);
-      b.dst.resource = dst->res;
-      b.dst.format = dst->res->format;
-      b.dst.level = p->resolve_level[i];
-      u_box_3d(0, 0, p->resolve_slice[i], w, h, 1, &b.dst.box);
-      b.mask = PIPE_MASK_RGBA;
-      b.filter = PIPE_TEX_FILTER_NEAREST;
-      pipe->blit(pipe, &b);
-   }
-   /* Released, not destroyed: the driver's batch took references of its own to the
-    * surfaces it draws into (freedreno's fd_batch_set_fb) and gives them back when the
-    * batch is freed, which can be after this -- the flush above does not wait. A surface
-    * destroyed here would be freed under that batch. Softpipe lets go at once, so only
-    * the Adreno can show the difference.
-    */
-   for (unsigned i = 0; i < p->color_count; i++)
-      if (p->surf[i])
-         pipe_surface_release(pipe, &p->surf[i]);
-   if (p->zsurf)
-      pipe_surface_release(pipe, &p->zsurf);
-   free(p);
-   device->pass = NULL;
-}
-
-void
-rwa_pass_end(struct rwa_device *device)
-{
-   RWA_HOLD(device);
-   pass_end_locked(device);
-}
-
-static struct pipe_surface *
-pass_surface(struct pipe_context *pipe, const struct rwa_texture *t, unsigned level,
-             unsigned slice)
-{
-   struct pipe_surface templ = { .format = t->res->format };
-   templ.u.tex.level = level;
-   templ.u.tex.first_layer = templ.u.tex.last_layer = slice;
-   return pipe->create_surface(pipe, t->res, &templ);
-}
-
-int
-rwa_pass_begin(struct rwa_device *device, const struct rwa_pass_desc *desc, char *why,
-               size_t why_size)
-{
-   RWA_HOLD(device);
-   struct pipe_context *pipe = device->pipe;
-
-   pass_end_locked(device);
-   if (!desc || desc->color_count > PIPE_MAX_COLOR_BUFS) {
-      say(why, why_size, "a render pass of %u colour attachments", desc ? desc->color_count : 0);
-      return -1;
-   }
-   unsigned w = 0, h = 0;
-   bool sized = false;
-   for (unsigned i = 0; i < desc->color_count; i++) {
-      const struct rwa_texture *t = desc->color[i].texture;
-      if (!t)
-         continue;
-      if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
-         say(why, why_size, "colour attachment %u (%s) was made without "
-                            "MTLTextureUsageRenderTarget", i, t->format_name);
-         return -1;
-      }
-      unsigned tw = u_minify(t->res->width0, desc->color[i].level);
-      unsigned th = u_minify(t->res->height0, desc->color[i].level);
-      if (!sized) {
-         w = tw;
-         h = th;
-         sized = true;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "colour attachment %u is %ux%u and the pass is %ux%u", i, tw, th,
-             w, h);
-         return -1;
-      }
-   }
-   if (desc->depth) {
-      const struct rwa_texture *t = desc->depth;
-      if (!(t->res->bind & PIPE_BIND_DEPTH_STENCIL)) {
-         say(why, why_size, "the depth attachment (%s) was made without "
-                            "MTLTextureUsageRenderTarget", t->format_name);
-         return -1;
-      }
-      unsigned tw = u_minify(t->res->width0, desc->depth_level);
-      unsigned th = u_minify(t->res->height0, desc->depth_level);
-      if (!sized) {
-         w = tw;
-         h = th;
-         sized = true;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "the depth attachment is %ux%u and the pass is %ux%u", tw, th, w,
-             h);
-         return -1;
-      }
-   }
-   if (!sized) {
-      say(why, why_size, "a render pass with no attachment at all");
-      return -1;
-   }
-
-   struct rwa_pass_state *p = calloc(1, sizeof(*p));
-   if (!p) {
-      say(why, why_size, "out of memory beginning a render pass");
-      return -1;
-   }
-   struct pipe_framebuffer_state fb = { .width = w, .height = h,
-                                        .nr_cbufs = desc->color_count };
-   for (unsigned i = 0; i < desc->color_count; i++) {
-      struct rwa_texture *t = desc->color[i].texture;
-      p->color[i] = t;
-      if (!t)
-         continue;
-      p->surf[i] = pass_surface(pipe, t, desc->color[i].level, desc->color[i].slice);
-      if (!p->surf[i]) {
-         say(why, why_size, "%s would not make a render surface of colour attachment %u",
-             rwa_device_name(device), i);
-         p->color_count = i;
-         device->pass = p;
-         pass_end_locked(device);
-         return -1;
-      }
-      fb.cbufs[i] = p->surf[i];
-      fb.samples = MAX2(fb.samples, t->res->nr_samples);
-   }
-   p->color_count = desc->color_count;
-   if (desc->depth) {
-      p->depth = desc->depth;
-      p->zsurf = pass_surface(pipe, desc->depth, desc->depth_level, desc->depth_slice);
-      if (!p->zsurf) {
-         say(why, why_size, "%s would not make a render surface of the depth attachment",
-             rwa_device_name(device));
-         device->pass = p;
-         pass_end_locked(device);
-         return -1;
-      }
-      fb.zsbuf = p->zsurf;
-   }
-   pipe->set_framebuffer_state(pipe, &fb);
-   device->pass = p;
-
-   /* The load actions, once for the pass: a clear per attachment (Gallium's clear takes
-    * one colour for every buffer it touches, and Metal gives each attachment its own),
-    * and the depth and stencil aspects together when both clear.
-    */
-   for (unsigned i = 0; i < desc->color_count; i++) {
-      if (!p->color[i] || desc->color[i].load_action != RWA_LOAD_CLEAR)
-         continue;
-      union pipe_color_union c;
-      memcpy(c.f, desc->color[i].clear, sizeof(c.f));
-      pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, NULL, &c, 0.0, 0);
-   }
-   if (desc->depth) {
-      unsigned mask = 0;
-      if (desc->depth_load_action == RWA_LOAD_CLEAR && format_has_depth(desc->depth->res->format))
-         mask |= PIPE_CLEAR_DEPTH;
-      if (desc->stencil_load_action == RWA_LOAD_CLEAR &&
-          format_has_stencil(desc->depth->res->format))
-         mask |= PIPE_CLEAR_STENCIL;
-      if (mask) {
-         union pipe_color_union c = { 0 };
-         pipe->clear(pipe, mask, NULL, &c, desc->clear_depth, desc->clear_stencil & 0xff);
-      }
-   }
-   return 0;
-}
-
-int
-rwa_pass_resolve(struct rwa_device *device, unsigned attachment, struct rwa_texture *resolve,
-                 unsigned level, unsigned slice, char *why, size_t why_size)
-{
-   RWA_HOLD(device);
-   struct rwa_pass_state *p = device->pass;
-
-   if (!p) {
-      say(why, why_size, "a resolve with no render pass to resolve");
-      return -1;
-   }
-   if (attachment >= p->color_count || !p->color[attachment]) {
-      say(why, why_size, "a resolve of colour attachment %u, which this pass does not have",
-          attachment);
-      return -1;
-   }
-   struct rwa_texture *src = p->color[attachment];
-   if (!resolve || resolve->device != device) {
-      say(why, why_size, "the resolve texture of colour attachment %u is not one of this "
-                         "device's", attachment);
-      return -1;
-   }
-   if (src->res->nr_samples <= 1 || resolve->res->nr_samples > 1) {
-      say(why, why_size, "a resolve of colour attachment %u from %u sample%s into %u: Metal "
-                         "resolves a multisample attachment into a one-sample texture",
-          attachment, MAX2(src->res->nr_samples, 1), src->res->nr_samples > 1 ? "s" : "",
-          MAX2(resolve->res->nr_samples, 1));
-      return -1;
-   }
-   unsigned sl = p->surf[attachment] ? p->surf[attachment]->u.tex.level : 0;
-   if (level > resolve->res->last_level ||
-       u_minify(resolve->res->width0, level) != u_minify(src->res->width0, sl) ||
-       u_minify(resolve->res->height0, level) != u_minify(src->res->height0, sl)) {
-      say(why, why_size, "the resolve texture of colour attachment %u is not the attachment's "
-                         "size at level %u", attachment, level);
-      return -1;
-   }
-   p->resolve[attachment] = resolve;
-   p->resolve_level[attachment] = level;
-   p->resolve_slice[attachment] = slice;
-   return 0;
-}
-
-int
-rwa_pass_draw(struct rwa_render *render, const struct rwa_draw *draw,
-              const struct rwa_draw_state *state, char *why, size_t why_size)
-{
-   struct rwa_device *device = render->device;
-   RWA_HOLD(device);
-   static const struct rwa_draw_state none = { 0 };
-
-   if (!device->pass) {
-      say(why, why_size, "a draw outside a render pass");
-      return -1;
-   }
-   if (!draw) {
-      say(why, why_size, "a draw with no description");
-      return -1;
-   }
-   /* The pass's attachments and no load actions of the draw's own: everything else is
-    * the caller's, and checked by the same code a lone draw is.
-    */
-   struct rwa_draw d = *draw;
-   d.color = device->pass->color;
-   d.color_count = device->pass->color_count;
-   d.depth = device->pass->depth;
-   d.clear_color = NULL;
-   d.clear_depth = NULL;
-   d.clear_stencil = NULL;
-   return render_draw_common(render, &d, state ? state : &none, false, &device->pass->fbound,
-                             &device->pass->vbound, why, why_size);
-}
-
-int
-rwa_submit(struct rwa_device *device, int wait, char *why, size_t why_size)
-{
-   RWA_HOLD(device);
-
-   pass_end_locked(device);
-   if (!wait) {
-      device->pipe->flush(device->pipe, NULL, PIPE_FLUSH_ASYNC);
-      return 0;
-   }
-   return finish_or_say_why(device, false, "command buffer", why, why_size);
-}
-
-/*
- * BLITS: MTLBlitCommandEncoder's copies, fills and mipmaps, in command buffer order. A copy
- * between a buffer and a texture goes through the processor's view of the buffer, which is
- * the one this library has; the GPU's work so far is finished first, because it may be
- * what wrote the source.
- */
-int
-rwa_copy_buffer(struct rwa_buffer *src, size_t src_offset, struct rwa_buffer *dst,
-                size_t dst_offset, size_t size, char *why, size_t why_size)
-{
-   if (!src || !dst || src->device != dst->device) {
-      say(why, why_size, "a buffer copy between buffers of two devices, or of none");
-      return -1;
-   }
-   if (src_offset > src->size || size > src->size - src_offset || dst_offset > dst->size ||
-       size > dst->size - dst_offset) {
-      say(why, why_size, "a copy of %zu bytes from offset %zu of %zu to offset %zu of %zu",
-          size, src_offset, src->size, dst_offset, dst->size);
-      return -1;
-   }
-   if (size == 0)
-      return 0;
-   RWA_HOLD(dst->device);
-   struct pipe_box box;
-   u_box_1d((int)src_offset, (int)size, &box);
-   dst->device->pipe->resource_copy_region(dst->device->pipe, dst->res, 0, (unsigned)dst_offset,
-                                           0, 0, src->res, 0, &box);
-   return 0;
-}
-
-int
-rwa_fill_buffer(struct rwa_buffer *dst, size_t offset, size_t size, unsigned char value,
-                char *why, size_t why_size)
-{
-   if (!dst || offset > dst->size || size > dst->size - offset) {
-      say(why, why_size, "a fill of %zu bytes at offset %zu of a buffer of %zu", size, offset,
-          dst ? dst->size : 0);
-      return -1;
-   }
-   if (size == 0)
-      return 0;
-   RWA_HOLD(dst->device);
-   struct pipe_context *pipe = dst->device->pipe;
-   /* freedreno's a6xx fills with the GPU; softpipe has no clear_buffer, and Gallium's
-    * default is a map and a memset, in order with the work before it */
-   void (*clear)(struct pipe_context *, struct pipe_resource *, unsigned, unsigned,
-                 const void *, int) = pipe->clear_buffer ? pipe->clear_buffer
-                                                         : u_default_clear_buffer;
-   uint32_t word = value * 0x01010101u;
-   clear(pipe, dst->res, (unsigned)offset, (unsigned)size, &word,
-         offset % 4 == 0 && size % 4 == 0 ? 4 : 1);
-   return 0;
-}
-
-int
-rwa_copy_texture(struct rwa_texture *src, unsigned src_slice, unsigned src_level,
-                 const unsigned src_origin[3], const unsigned size[3], struct rwa_texture *dst,
-                 unsigned dst_slice, unsigned dst_level, const unsigned dst_origin[3],
-                 char *why, size_t why_size)
-{
-   if (!src || !dst || src->device != dst->device) {
-      say(why, why_size, "a texture copy between textures of two devices, or of none");
-      return -1;
-   }
-   if (util_format_get_blocksize(src->res->format) !=
-       util_format_get_blocksize(dst->res->format)) {
-      say(why, why_size, "a copy from %s to %s, whose texels are not the same size",
-          src->format_name, dst->format_name);
-      return -1;
-   }
-   if (src_level > src->res->last_level || dst_level > dst->res->last_level) {
-      say(why, why_size, "a copy from level %u of %u to level %u of %u", src_level,
-          src->res->last_level + 1, dst_level, dst->res->last_level + 1);
-      return -1;
-   }
-   bool src3d = src->res->target == PIPE_TEXTURE_3D, dst3d = dst->res->target == PIPE_TEXTURE_3D;
-   struct pipe_box box;
-   u_box_3d((int)src_origin[0], (int)src_origin[1],
-            (int)(src3d ? src_origin[2] : src_slice), (int)size[0], (int)size[1],
-            (int)(src3d ? size[2] : 1), &box);
-   if (size[0] == 0 || size[1] == 0 || (src3d && size[2] == 0))
-      return 0;
-   RWA_HOLD(dst->device);
-   dst->device->pipe->resource_copy_region(dst->device->pipe, dst->res, dst_level, dst_origin[0],
-                                           dst_origin[1], dst3d ? dst_origin[2] : dst_slice,
-                                           src->res, src_level, &box);
-   return 0;
-}
-
-int
-rwa_generate_mipmaps(struct rwa_texture *texture, char *why, size_t why_size)
-{
-   if (!texture) {
-      say(why, why_size, "mipmaps of no texture");
-      return -1;
-   }
-   if (texture->res->last_level == 0)
-      return 0;
-   RWA_HOLD(texture->device);
-   if (!util_gen_mipmap(texture->device->pipe, texture->res, texture->res->format, 0,
-                        texture->res->last_level, 0, util_max_layer(texture->res, 0),
-                        PIPE_TEX_FILTER_LINEAR)) {
-      say(why, why_size, "%s would not make the mipmaps of a %s", rwa_device_name(texture->device),
-          texture->format_name);
-      return -1;
-   }
-   return 0;
-}
-
-int
-rwa_copy_buffer_to_texture(struct rwa_buffer *src, size_t offset, size_t bytes_per_row,
-                           size_t bytes_per_image, const unsigned size[3],
-                           struct rwa_texture *dst, unsigned slice, unsigned level,
-                           const unsigned origin[3], char *why, size_t why_size)
-{
-   if (!src || !dst || src->device != dst->device) {
-      say(why, why_size, "a copy from a buffer to a texture of another device, or of none");
-      return -1;
-   }
-   bool is3d = dst->res->target == PIPE_TEXTURE_3D;
-   unsigned depth = is3d ? MAX2(size[2], 1) : 1;
-   size_t rows = util_format_get_nblocksy(dst->res->format, size[1]);
-   size_t need = offset + (depth - 1) * bytes_per_image + (rows ? (rows - 1) * bytes_per_row : 0) +
-                 util_format_get_stride(dst->res->format, size[0]);
-   if (need > src->size) {
-      say(why, why_size, "a copy of %ux%ux%u texels needs %zu bytes of a buffer of %zu",
-          size[0], size[1], depth, need, src->size);
-      return -1;
-   }
-   RWA_HOLD(dst->device);
-   if (finish_or_say_why(dst->device, false, "copy", why, why_size) != 0)
-      return -1;
-   struct pipe_box box;
-   u_box_3d((int)origin[0], (int)origin[1], (int)(is3d ? origin[2] : slice), (int)size[0],
-            (int)size[1], (int)depth, &box);
-   dst->device->pipe->texture_subdata(dst->device->pipe, dst->res, level, PIPE_MAP_WRITE, &box,
-                                      (const char *)src->map + offset, (unsigned)bytes_per_row,
-                                      (uintptr_t)bytes_per_image);
-   return 0;
-}
-
-int
-rwa_copy_texture_to_buffer(struct rwa_texture *src, unsigned slice, unsigned level,
-                           const unsigned origin[3], const unsigned size[3],
-                           struct rwa_buffer *dst, size_t offset, size_t bytes_per_row,
-                           size_t bytes_per_image, char *why, size_t why_size)
-{
-   if (!src || !dst || src->device != dst->device) {
-      say(why, why_size, "a copy from a texture to a buffer of another device, or of none");
-      return -1;
-   }
-   bool is3d = src->res->target == PIPE_TEXTURE_3D;
-   unsigned depth = is3d ? MAX2(size[2], 1) : 1;
-   size_t rows = util_format_get_nblocksy(src->res->format, size[1]);
-   size_t row_bytes = util_format_get_stride(src->res->format, size[0]);
-   size_t need = offset + (depth - 1) * bytes_per_image + (rows ? (rows - 1) * bytes_per_row : 0) +
-                 row_bytes;
-   if (need > dst->size) {
-      say(why, why_size, "a copy of %ux%ux%u texels needs %zu bytes of a buffer of %zu",
-          size[0], size[1], depth, need, dst->size);
-      return -1;
-   }
-   RWA_HOLD(src->device);
-   struct pipe_context *pipe = src->device->pipe;
-   struct pipe_box box;
-   u_box_3d((int)origin[0], (int)origin[1], (int)(is3d ? origin[2] : slice), (int)size[0],
-            (int)size[1], (int)depth, &box);
-   struct pipe_transfer *xfer = NULL;
-   const uint8_t *map = pipe->texture_map(pipe, src->res, level, PIPE_MAP_READ, &box, &xfer);
-   if (!map) {
-      say(why, why_size, "%s would not map the %s to read it", rwa_device_name(src->device),
-          src->format_name);
-      return -1;
-   }
-   for (unsigned z = 0; z < depth; z++)
-      for (size_t y = 0; y < rows; y++)
-         memcpy((uint8_t *)dst->map + offset + z * bytes_per_image + y * bytes_per_row,
-                map + z * xfer->layer_stride + y * xfer->stride, row_bytes);
-   pipe->texture_unmap(pipe, xfer);
-   return 0;
-}
-

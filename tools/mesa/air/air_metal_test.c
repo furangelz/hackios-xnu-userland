@@ -5474,12 +5474,6 @@ metal_factor(unsigned f, unsigned channel, const float src[4], const float dst[4
    case BF_INV_DST_ALPHA: return 1.0f - dst[3];
    case BF_SRC_ALPHA_SAT:
       return channel < 3 ? blend_min(src[3], 1.0f - dst[3]) : 1.0f;
-   /* the blend colour, at Metal's default -- transparent black -- because these draws
-    * set none (it is encoder state: rwa_draw_state.blend_color in a pass) */
-   case BF_BLEND_COLOR:     return 0.0f;
-   case BF_BLEND_COLOR + 1: return 1.0f;   /* OneMinusBlendColor */
-   case BF_BLEND_COLOR + 2: return 0.0f;   /* BlendAlpha */
-   case BF_BLEND_COLOR + 3: return 1.0f;   /* OneMinusBlendAlpha */
    default:
       *modelled = false;
       return 0.0f;
@@ -5494,9 +5488,8 @@ metal_factor(unsigned f, unsigned channel, const float src[4], const float dst[4
  * the mistake this library's table exists to prevent.
  *
  * The two constant-colour factors answer 0 and their inverses 1, because that is what a
- * Gallium context holds before anyone calls set_blend_color -- which nothing here does:
- * the library sets the encoder's blend colour in a pass (rwa_draw_state), and a lone draw
- * leaves Metal's default, transparent black.
+ * Gallium context holds before anyone calls set_blend_color -- which nothing here does,
+ * and which is why the library refuses Metal's BlendColor factors outright.
  */
 static float
 gallium_factor(unsigned pf, unsigned channel, const float src[4], const float dst[4],
@@ -5834,14 +5827,12 @@ run_blend(const char *path, const char *func)
                  CWM_ALL), false,
         { .blending_enabled = 0, .write_mask = CWM_NONE } },
 
-      { "MTLBlendFactorBlendColor at the default blend colour (transparent black): served "
-        "since the encoder's blend colour reaches the draw", MTL_RGBA32_FLOAT, 1, 1,
-        BLEND_ON(BF_BLEND_COLOR, BF_INV_SRC_ALPHA, BO_ADD, BF_ONE, BF_INV_SRC_ALPHA,
-                 BO_ADD, CWM_ALL), false },
-
       /* AND WHAT MUST BE REFUSED BY NAME. Every one of these would otherwise draw
        * something.
        */
+      { "MTLBlendFactorBlendColor, whose colour is encoder state", MTL_RGBA32_FLOAT, 1, 1,
+        BLEND_ON(BF_BLEND_COLOR, BF_INV_SRC_ALPHA, BO_ADD, BF_ONE, BF_INV_SRC_ALPHA,
+                 BO_ADD, CWM_ALL), true },
       { "MTLBlendFactorSource1Color: dual-source, with no second output in the contract",
         MTL_RGBA32_FLOAT, 1, 1,
         BLEND_ON(BF_SRC1_COLOR, BF_INV_SRC_ALPHA, BO_ADD, BF_ONE, BF_INV_SRC_ALPHA,
@@ -6224,331 +6215,6 @@ run_blend(const char *path, const char *func)
    return (wrong || refused_wrong || thin || !served) ? 1 : 0;
 }
 
-/*
- * --pass: the way the Metal driver draws, which is a pass and not a draw. rwa_pass_begin
- * applies the load actions once, the draws follow with the encoder's state, rwa_pass_end,
- * and one rwa_submit for the command buffer -- the sequence userland/src/redwoodmetal.m
- * runs at -commit, under the device lock as it holds it. FUNCTION writes the float4 its
- * fragment buffers hold (clearFragment01 reads buffer 14), into one BGRA8Unorm
- * attachment that is not square, so a transposed or mirrored picture cannot pass.
- *
- * Three command buffers, each read back whole:
- *   1. the triangle program's frame: cleared to blue, then three vertices of the generated
- *      quad in orange, which is the triangle through clip (-1,-1), (1,-1) and (-1,1)
- *   2. loaded, two draws with different state: the whole quad in green under a scissor,
- *      then the triangle in red with a viewport of the left half; every pixel outside
- *      both must still be frame 1's
- *   3. blits: the attachment copied into a second texture, that one into a buffer, and a
- *      fill and a buffer copy over the result
- *   4. frame 1 again into a four-sample attachment, resolved when the pass ends into a
- *      one-sample texture (rwa_pass_resolve); the pixels the edge does not cross must be
- *      exact, the ones it crosses anything between the two colours
- */
-#define PASS_W 16
-#define PASS_H 12
-
-/* the triangle of the generated quad's first three corners, in a viewport of w x h at x0 */
-static bool
-pass_covered(unsigned x, unsigned y, unsigned x0, unsigned w, unsigned h)
-{
-   if (x < x0 || x >= x0 + w)
-      return false;
-   return (unsigned long long)(2 * (x - x0) + 1) * h < (unsigned long long)(2 * y + 1) * w;
-}
-
-static void
-pass_bgra(uint8_t out[4], const float rgba[4])
-{
-   out[0] = (uint8_t)(rgba[2] * 255.0f + 0.5f);
-   out[1] = (uint8_t)(rgba[1] * 255.0f + 0.5f);
-   out[2] = (uint8_t)(rgba[0] * 255.0f + 0.5f);
-   out[3] = (uint8_t)(rgba[3] * 255.0f + 0.5f);
-}
-
-/* every texel against `want`; the first few that differ are named */
-static unsigned
-pass_compare(const char *what, const uint8_t *got, const uint8_t *want)
-{
-   unsigned bad = 0;
-
-   for (unsigned y = 0; y < PASS_H; y++)
-      for (unsigned x = 0; x < PASS_W; x++) {
-         const uint8_t *g = got + (y * PASS_W + x) * 4, *w = want + (y * PASS_W + x) * 4;
-         if (!memcmp(g, w, 4))
-            continue;
-         if (bad++ < 6)
-            printf("air_metal_test: %s: texel (%u, %u) is B %u G %u R %u A %u and should be "
-                   "B %u G %u R %u A %u\n", what, x, y, g[0], g[1], g[2], g[3], w[0], w[1],
-                   w[2], w[3]);
-      }
-   printf("air_metal_test: %s: %u of %u texels wrong\n", what, bad, PASS_W * PASS_H);
-   return bad;
-}
-
-static int
-run_pass(const char *path, const char *func)
-{
-   struct metallib lib = { 0 };
-   if (!load_metallib(path, &lib))
-      return 1;
-
-   char name[256];
-   const uint8_t *bitcode = NULL;
-   size_t bitcode_size = 0;
-   if (!find_function(&lib, func, name, sizeof(name), &bitcode, &bitcode_size))
-      return 1;
-
-   setenv("RWA_SOFTWARE", "1", 0);
-
-   char why[WHY] = "";
-   struct rwa_device *device = rwa_device_open(why, sizeof(why));
-   if (!device) {
-      printf("air_metal_test: rwa_device_open: %s\n", why);
-      return 1;
-   }
-   printf("air_metal_test: --pass %s on \"%s\", one BGRA8Unorm attachment of %ux%u\n", name,
-          rwa_device_name(device), PASS_W, PASS_H);
-
-   const unsigned bgra8 = 80;   /* MTLPixelFormatBGRA8Unorm, the drawables' format */
-   struct rwa_render_shape shape = { .color_count = 1, .sample_count = 1,
-                                     .color_format = { bgra8 } };
-   struct rwa_render_info info = { 0 };
-   struct rwa_render *render = rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size,
-                                                 func, &shape, &info, why, sizeof(why));
-   if (!render) {
-      printf("air_metal_test: rwa_render_create: %s\n", why);
-      return 1;
-   }
-
-   const struct rwa_texture_shape ts = {
-      .pixel_format = bgra8, .type = MTL_TEXTURE_TYPE_2D, .width = PASS_W,
-      .height = PASS_H, .depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
-      .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
-   };
-   struct rwa_texture *target = rwa_texture_create(device, &ts, why, sizeof(why));
-   struct rwa_texture *copy = target ? rwa_texture_create(device, &ts, why, sizeof(why)) : NULL;
-   if (!copy) {
-      printf("air_metal_test: rwa_texture_create: %s\n", why);
-      return 1;
-   }
-
-   /* one constant buffer per colour, bound at every index the way the triangle program
-    * binds its one */
-   static const float orange[4] = { 1.0f, 128.0f / 255.0f, 0.0f, 1.0f };
-   static const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
-   static const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
-   static const float blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
-   const float *colours[3] = { orange, green, red };
-   struct rwa_buffer *uniform[3];
-   struct rwa_buffer *table[3][16];
-   for (unsigned c = 0; c < 3; c++) {
-      uniform[c] = rwa_buffer_create(device, 256, why, sizeof(why));
-      if (!uniform[c]) {
-         printf("air_metal_test: rwa_buffer_create: %s\n", why);
-         return 1;
-      }
-      memset(rwa_buffer_map(uniform[c]), 0, 256);
-      memcpy(rwa_buffer_map(uniform[c]), colours[c], 16);
-      for (unsigned i = 0; i < 16; i++)
-         table[c][i] = uniform[c];
-   }
-   unsigned nbuf = info.fragment_buffers < 16 ? info.fragment_buffers : 16;
-
-   static uint8_t want[PASS_W * PASS_H * 4], got[PASS_W * PASS_H * 4];
-   const unsigned origin[3] = { 0, 0, 0 }, extent[3] = { PASS_W, PASS_H, 1 };
-   unsigned bad = 0;
-
-   /* 1. the triangle program's frame */
-   struct rwa_pass_desc pass = { .color_count = 1 };
-   pass.color[0] = (struct rwa_pass_color){ .texture = target, .load_action = RWA_LOAD_CLEAR,
-                                            .clear = { 0.0f, 0.0f, 1.0f, 1.0f } };
-   struct rwa_draw draw = {
-      .fragment = { .buffers = table[0], .buffer_count = nbuf },
-      .primitive = 3 /* MTLPrimitiveTypeTriangle */, .vertex_count = 3,
-   };
-   struct rwa_draw_state state = { 0 };
-   rwa_device_lock(device);
-   int rc = rwa_pass_begin(device, &pass, why, sizeof(why));
-   if (rc == 0)
-      rc = rwa_pass_draw(render, &draw, &state, why, sizeof(why));
-   rwa_pass_end(device);
-   if (rc == 0)
-      rc = rwa_submit(device, 1, why, sizeof(why));
-   rwa_device_unlock(device);
-   if (rc != 0) {
-      printf("air_metal_test: frame 1: %s\n", why);
-      return 1;
-   }
-   for (unsigned y = 0; y < PASS_H; y++)
-      for (unsigned x = 0; x < PASS_W; x++)
-         pass_bgra(want + (y * PASS_W + x) * 4,
-                   pass_covered(x, y, 0, PASS_W, PASS_H) ? orange : blue);
-   if (rwa_texture_read(target, 0, 0, origin, extent, got, 0, why, sizeof(why)) != 0) {
-      printf("air_metal_test: rwa_texture_read: %s\n", why);
-      return 1;
-   }
-   bad += pass_compare("frame 1 (cleared, one triangle)", got, want);
-
-   /* 2. loaded; a scissored quad, then a triangle in a viewport of the left half */
-   const unsigned sx = 3, sy = 2, sw = 9, sh = 5;
-   pass.color[0].load_action = RWA_LOAD_LOAD;
-   rwa_device_lock(device);
-   rc = rwa_pass_begin(device, &pass, why, sizeof(why));
-   if (rc == 0) {
-      draw.fragment.buffers = table[1];
-      draw.primitive = 4;   /* MTLPrimitiveTypeTriangleStrip: the whole quad */
-      draw.vertex_count = 4;
-      state = (struct rwa_draw_state){ .scissor_enabled = 1, .scissor = { sx, sy, sw, sh } };
-      rc = rwa_pass_draw(render, &draw, &state, why, sizeof(why));
-   }
-   if (rc == 0) {
-      draw.fragment.buffers = table[2];
-      draw.primitive = 3;
-      draw.vertex_count = 3;
-      state = (struct rwa_draw_state){ .viewport = { 0.0f, 0.0f, PASS_W / 2, PASS_H, 0.0f,
-                                                     1.0f } };
-      rc = rwa_pass_draw(render, &draw, &state, why, sizeof(why));
-   }
-   rwa_pass_end(device);
-   if (rc == 0)
-      rc = rwa_submit(device, 1, why, sizeof(why));
-   rwa_device_unlock(device);
-   if (rc != 0) {
-      printf("air_metal_test: frame 2: %s\n", why);
-      return 1;
-   }
-   for (unsigned y = 0; y < PASS_H; y++)
-      for (unsigned x = 0; x < PASS_W; x++) {
-         if (pass_covered(x, y, 0, PASS_W / 2, PASS_H))
-            pass_bgra(want + (y * PASS_W + x) * 4, red);
-         else if (x >= sx && x < sx + sw && y >= sy && y < sy + sh)
-            pass_bgra(want + (y * PASS_W + x) * 4, green);
-      }
-   if (rwa_texture_read(target, 0, 0, origin, extent, got, 0, why, sizeof(why)) != 0) {
-      printf("air_metal_test: rwa_texture_read: %s\n", why);
-      return 1;
-   }
-   bad += pass_compare("frame 2 (loaded, a scissor, then a viewport)", got, want);
-
-   /* 3. blits */
-   struct rwa_buffer *bytes = rwa_buffer_create(device, sizeof(got), why, sizeof(why));
-   struct rwa_buffer *bytes2 = bytes ? rwa_buffer_create(device, sizeof(got), why, sizeof(why))
-                                     : NULL;
-   if (!bytes2) {
-      printf("air_metal_test: rwa_buffer_create: %s\n", why);
-      return 1;
-   }
-   rwa_device_lock(device);
-   rc = rwa_copy_texture(target, 0, 0, origin, extent, copy, 0, 0, origin, why, sizeof(why));
-   if (rc == 0)
-      rc = rwa_copy_texture_to_buffer(copy, 0, 0, origin, extent, bytes, 0, PASS_W * 4,
-                                      sizeof(got), why, sizeof(why));
-   if (rc == 0)
-      rc = rwa_fill_buffer(bytes, 4, 8, 0xab, why, sizeof(why));
-   if (rc == 0)
-      rc = rwa_copy_buffer(bytes, 0, bytes2, 0, sizeof(got), why, sizeof(why));
-   if (rc == 0)
-      rc = rwa_submit(device, 1, why, sizeof(why));
-   rwa_device_unlock(device);
-   if (rc != 0) {
-      printf("air_metal_test: frame 3: %s\n", why);
-      return 1;
-   }
-   memset(want + 4, 0xab, 8);
-   bad += pass_compare("frame 3 (texture copy, to a buffer, a fill, a buffer copy)",
-                       rwa_buffer_map(bytes2), want);
-
-   /* 4. four samples, resolved */
-   struct rwa_render_shape mshape = shape;
-   mshape.sample_count = 4;
-   struct rwa_render *mrender = rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size,
-                                                  func, &mshape, &info, why, sizeof(why));
-   struct rwa_texture_shape mts = ts;
-   mts.type = MTL_TEXTURE_TYPE_2D_MULTISAMPLE;
-   mts.sample_count = 4;
-   mts.usage = MTL_USAGE_RENDER_TARGET;
-   struct rwa_texture *msaa = mrender ? rwa_texture_create(device, &mts, why, sizeof(why)) : NULL;
-   /* softpipe renders into no multisample texture at all, so on this machine frame 4 is
-    * said and skipped; it is the Adreno's */
-   if (!msaa) {
-      printf("air_metal_test: frame 4 not drawn on \"%s\": %s\n", rwa_device_name(device),
-             why);
-      if (mrender)
-         rwa_render_destroy(mrender);
-      goto done;
-   }
-   pass.color[0] = (struct rwa_pass_color){ .texture = msaa, .load_action = RWA_LOAD_CLEAR,
-                                            .clear = { 0.0f, 0.0f, 1.0f, 1.0f } };
-   draw.fragment.buffers = table[0];
-   draw.primitive = 3;
-   draw.vertex_count = 3;
-   state = (struct rwa_draw_state){ 0 };
-   rwa_device_lock(device);
-   rc = rwa_pass_begin(device, &pass, why, sizeof(why));
-   if (rc == 0)
-      rc = rwa_pass_resolve(device, 0, copy, 0, 0, why, sizeof(why));
-   if (rc == 0)
-      rc = rwa_pass_draw(mrender, &draw, &state, why, sizeof(why));
-   rwa_pass_end(device);
-   if (rc == 0)
-      rc = rwa_submit(device, 1, why, sizeof(why));
-   rwa_device_unlock(device);
-   if (rc != 0) {
-      printf("air_metal_test: frame 4: %s\n", why);
-      return 1;
-   }
-   if (rwa_texture_read(copy, 0, 0, origin, extent, got, 0, why, sizeof(why)) != 0) {
-      printf("air_metal_test: rwa_texture_read: %s\n", why);
-      return 1;
-   }
-   unsigned edge = 0;
-   for (unsigned y = 0; y < PASS_H; y++)
-      for (unsigned x = 0; x < PASS_W; x++) {
-         bool in = pass_covered(x, y, 0, PASS_W, PASS_H), crossed = false;
-         for (int dy = -1; dy <= 1; dy++)
-            for (int dx = -1; dx <= 1; dx++) {
-               int nx = (int)x + dx, ny = (int)y + dy;
-               if (nx >= 0 && ny >= 0 && nx < PASS_W && ny < PASS_H &&
-                   pass_covered(nx, ny, 0, PASS_W, PASS_H) != in)
-                  crossed = true;
-            }
-         uint8_t *w = want + (y * PASS_W + x) * 4, *g = got + (y * PASS_W + x) * 4;
-         pass_bgra(w, in ? orange : blue);
-         if (crossed) {
-            /* between the two colours, channel by channel */
-            uint8_t a[4], b[4];
-            pass_bgra(a, orange);
-            pass_bgra(b, blue);
-            bool between = true;
-            for (unsigned k = 0; k < 4; k++) {
-               uint8_t lo = a[k] < b[k] ? a[k] : b[k], hi = a[k] < b[k] ? b[k] : a[k];
-               between = between && g[k] >= lo && g[k] <= hi;
-            }
-            if (between)
-               memcpy(w, g, 4);
-            edge++;
-         }
-      }
-   bad += pass_compare("frame 4 (four samples, resolved)", got, want);
-   printf("air_metal_test: frame 4: %u texels the edge crosses, held only to lie between the "
-          "two colours\n", edge);
-   rwa_texture_destroy(msaa);
-   rwa_render_destroy(mrender);
-
-done:
-
-   rwa_buffer_destroy(bytes2);
-   rwa_buffer_destroy(bytes);
-   for (unsigned c = 0; c < 3; c++)
-      rwa_buffer_destroy(uniform[c]);
-   rwa_texture_destroy(copy);
-   rwa_texture_destroy(target);
-   rwa_render_destroy(render);
-   rwa_device_close(device);
-   printf("air_metal_test: --pass: %s\n", bad ? "WRONG" : "every texel drawn is right");
-   return bad ? 1 : 0;
-}
-
 int
 main(int argc, char **argv)
 {
@@ -6592,15 +6258,6 @@ main(int argc, char **argv)
          return 2;
       }
       return run_draw_argbuf(argv[2], argv[3]);
-   }
-
-   /* --pass: the driver's own sequence, passes and blits, read back */
-   if (argc >= 2 && !strcmp(argv[1], "--pass")) {
-      if (argc < 4) {
-         fprintf(stderr, "usage: air_metal_test --pass FILE.metallib FUNCTION\n");
-         return 2;
-      }
-      return run_pass(argv[2], argv[3]);
    }
 
    /* --surface takes no .metallib at all: it is about memory, not about a shader. */
