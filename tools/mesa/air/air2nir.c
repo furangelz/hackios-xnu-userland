@@ -523,8 +523,34 @@ main(int argc, char **argv)
 {
    enum { TRANSLATE, LL, LIST, REPORT, EVAL, INTERFACE } mode = TRANSLATE;
    int i = 1;
-   while (i < argc && !strcmp(argv[i], "--library"))
-      library_wrapper = true, i++;
+   /* --fc INDEX=VALUE[,INDEX=VALUE...]: the function constants a pipeline gives,
+    * as a specialised MTLFunction carries them -- only these are defined, every
+    * other is undefined (air.is_function_constant_defined answers false). */
+   static struct air_constant_value given[256];
+   unsigned num_given = 0;
+   bool specialised = false;
+   for (;;) {
+      if (i < argc && !strcmp(argv[i], "--library")) {
+         library_wrapper = true, i++;
+         continue;
+      }
+      if (i + 1 < argc && !strcmp(argv[i], "--fc")) {
+         specialised = true;
+         for (char *p = argv[i + 1]; *p && num_given < 256;) {
+            char *end;
+            unsigned idx = (unsigned)strtoul(p, &end, 0);
+            if (*end != '=')
+               break;
+            given[num_given].index = idx;
+            given[num_given].bits = strtoull(end + 1, &end, 0);
+            num_given++;
+            p = *end == ',' ? end + 1 : end;
+         }
+         i += 2;
+         continue;
+      }
+      break;
+   }
    if (i < argc && !strcmp(argv[i], "--ll"))
       mode = LL, i++;
    else if (i < argc && !strcmp(argv[i], "--list"))
@@ -608,6 +634,10 @@ main(int argc, char **argv)
       unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
       struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper };
+      if (specialised) {
+         options.constants = given;
+         options.num_constants = num_given;
+      }
       struct air_shader_info info;
       nir_shader *nir = air_to_nir(ctx, mods[k].bitcode, mods[k].size, NULL, &options,
                                    &default_options, &info, &err);
